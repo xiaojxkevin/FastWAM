@@ -2,7 +2,7 @@
 
 defaults:
   - override /data: cloth_folding
-  - override /model: fastwam_joint
+  - override /model: fastwam
   - _self_
 
 # dataloading
@@ -15,7 +15,7 @@ model:
 # scheduler
 lr_scheduler_type: "cosine"
 learning_rate: 1e-4
-num_epochs: 5
+num_epochs: 8
 max_steps: null
 log_every: 10
 save_every: 2500

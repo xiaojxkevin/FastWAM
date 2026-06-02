@@ -610,12 +610,49 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
     def load_hf_dataset(self) -> datasets.Dataset:
         """hf_dataset contains all the observations, states, actions, rewards, etc."""
+        # datasets>=3.0 removed the "List" feature type.  Parquet files written
+        # by LeRobot use List-annotated columns (action, observation.state,
+        # complementary_info.policy_action, …).  Build features from the actual
+        # parquet schema so every column is covered, mapping pa.list_ →
+        # datasets.Sequence.
+        import pyarrow as pa
+
+        if self.episodes is None:
+            parquet_files = sorted(self.root.glob("data/*/*.parquet"))
+        else:
+            parquet_files = [self.root / self.meta.get_data_file_path(ep_idx)
+                             for ep_idx in self.episodes]
+        if not parquet_files:
+            raise FileNotFoundError(f"No parquet files found under {self.root}")
+        parquet_schema = pq.read_schema(str(parquet_files[0]))
+
+        hf_features = {}
+        for field_idx in range(len(parquet_schema)):
+            field = parquet_schema.field(field_idx)
+            col_name = field.name
+            col_type = field.type
+            if pa.types.is_list(col_type) or pa.types.is_large_list(col_type):
+                elem_type = col_type.value_type
+                dtype = "float32" if pa.types.is_floating(elem_type) else "int64"
+                hf_features[col_name] = datasets.Sequence(
+                    feature=datasets.Value(dtype=dtype), length=-1
+                )
+            elif pa.types.is_floating(col_type):
+                hf_features[col_name] = datasets.Value(dtype="float32")
+            elif pa.types.is_integer(col_type):
+                hf_features[col_name] = datasets.Value(dtype="int64")
+            elif pa.types.is_string(col_type) or pa.types.is_large_string(col_type):
+                hf_features[col_name] = datasets.Value(dtype="string")
+            else:
+                hf_features[col_name] = datasets.Value(dtype="string")
+        features = datasets.Features(hf_features)
+
         if self.episodes is None:
             path = str(self.root / "data")
-            hf_dataset = load_dataset("parquet", data_dir=path, split="train")
+            hf_dataset = load_dataset("parquet", data_dir=path, split="train", features=features)
         else:
-            files = [str(self.root / self.meta.get_data_file_path(ep_idx)) for ep_idx in self.episodes]
-            hf_dataset = load_dataset("parquet", data_files=files, split="train")
+            files = [str(f) for f in parquet_files]
+            hf_dataset = load_dataset("parquet", data_files=files, split="train", features=features)
 
         # TODO(aliberts): hf_dataset.set_format("torch")
         hf_dataset.set_transform(hf_transform_to_torch)
@@ -1255,7 +1292,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
                             category=UserWarning,
                         )
                         # deal with string in parquet file
-                        if np_arr.dtype == 'O':                        
+                        if np_arr.dtype == 'O' or np.issubdtype(np_arr.dtype, np.str_):
                             result_dict[col_name] = np_arr
                         else:
                             result_dict[col_name] = torch.from_numpy(np_arr)
