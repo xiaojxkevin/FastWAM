@@ -29,13 +29,42 @@ from datasets.features.features import register_feature
 from PIL import Image
 
 
+_TORCHCODEC_WORKS = None
+
+
+def _check_torchcodec_works() -> bool:
+    """Actually test whether torchcodec can load its C++ backend (needs FFmpeg libs).
+
+    The check is done once and cached globally so we don't pay the cost of a
+    C++ exception on *every* video-decode call.
+    """
+    global _TORCHCODEC_WORKS
+    if _TORCHCODEC_WORKS is not None:
+        return _TORCHCODEC_WORKS
+    if not importlib.util.find_spec("torchcodec"):
+        _TORCHCODEC_WORKS = False
+        return False
+    try:
+        # Force-load the C++ extension — this is where FFmpeg .so resolution
+        # happens.  If libavutil / libavcodec etc. are missing a RuntimeError
+        # is raised.
+        from torchcodec.decoders import VideoDecoder  # noqa: F401
+        _TORCHCODEC_WORKS = True
+        return True
+    except RuntimeError:
+        logging.warning(
+            "torchcodec is installed but its C++ backend failed to load "
+            "(likely missing FFmpeg system libraries: libavutil.so etc.). "
+            "Falling back to pyav for all video decoding."
+        )
+        _TORCHCODEC_WORKS = False
+        return False
+
+
 def get_safe_default_codec():
-    if importlib.util.find_spec("torchcodec"):
+    if _check_torchcodec_works():
         return "torchcodec"
     else:
-        logging.warning(
-            "'torchcodec' is not available in your platform, falling back to 'pyav' as a default decoder"
-        )
         return "pyav"
 
 

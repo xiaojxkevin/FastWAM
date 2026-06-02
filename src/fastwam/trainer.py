@@ -10,6 +10,7 @@ import time
 import numpy as np
 import torch
 from accelerate import Accelerator
+from accelerate.utils import DeepSpeedPlugin
 from omegaconf import DictConfig
 from PIL import Image
 from torch.optim.lr_scheduler import ConstantLR, CosineAnnealingLR, LinearLR, SequentialLR
@@ -56,16 +57,36 @@ class Wan22Trainer:
             )
         self.wandb_enabled = bool(cfg.wandb.enabled)
 
+        use_deepspeed = os.environ.get("ACCELERATE_USE_DEEPSPEED", "false").lower() == "true"
+        deepspeed_config_file = os.environ.get("ACCELERATE_DEEPSPEED_CONFIG_FILE")
+        deepspeed_plugin = None
+        if use_deepspeed:
+            if not deepspeed_config_file:
+                deepspeed_config_file = "scripts/ds_configs/ds_zero1_config.json"
+            deepspeed_plugin = DeepSpeedPlugin(hf_ds_config=deepspeed_config_file)
+
         self.accelerator = Accelerator(
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             mixed_precision=self.mixed_precision,
             step_scheduler_with_optimizer=False,
+            deepspeed_plugin=deepspeed_plugin,
         )
-        
+
+        print(f"[DEBUG] I am Process {self.accelerator.process_index}, Global Rank {self.accelerator.state.process_index}, World Size {self.accelerator.state.num_processes}")
+
+        self.accelerator.print("Waiting for ALL nodes and ALL GPUs to be ready...")
+        self.accelerator.wait_for_everyone()
+        self.accelerator.print("SUCCESS: All nodes are connected. Barrier passed!")
+
+        state_deepspeed_plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
+        zero_stage = "disabled"
+        if state_deepspeed_plugin is not None:
+            zero_stage = state_deepspeed_plugin.deepspeed_config.get("zero_optimization", {}).get("stage", "unknown")
+
         logger.info(
             "Accelerate training: distributed_type=%s zero_stage=%s world_size=%d process_index=%d cfg_mixed_precision=%s accelerator_mixed_precision=%s grad_accum=%d grad_clip=%.4f",
             self.accelerator.distributed_type,
-            self.accelerator.state.deepspeed_plugin.deepspeed_config.get("zero_optimization", {}).get("stage", "unknown"),
+            zero_stage,
             self.accelerator.num_processes,
             self.accelerator.process_index,
             self.mixed_precision,
@@ -73,6 +94,21 @@ class Wan22Trainer:
             self.gradient_accumulation_steps,
             self.max_grad_norm,
         )
+        logger.info(
+            "Launch env: LOCAL_RANK=%s RANK=%s WORLD_SIZE=%s MASTER_ADDR=%s MASTER_PORT=%s ACCELERATE_USE_DEEPSPEED=%s ACCELERATE_DEEPSPEED_CONFIG_FILE=%s",
+            os.environ.get("LOCAL_RANK", "<unset>"),
+            os.environ.get("RANK", "<unset>"),
+            os.environ.get("WORLD_SIZE", "<unset>"),
+            os.environ.get("MASTER_ADDR", "<unset>"),
+            os.environ.get("MASTER_PORT", "<unset>"),
+            os.environ.get("ACCELERATE_USE_DEEPSPEED", "<unset>"),
+            os.environ.get("ACCELERATE_DEEPSPEED_CONFIG_FILE", "<unset>"),
+        )
+        if use_deepspeed and state_deepspeed_plugin is None:
+            raise RuntimeError(
+                "DeepSpeed was requested but Accelerator did not initialize a DeepSpeed plugin. "
+                "Check the launcher and ACCELERATE_DEEPSPEED_CONFIG_FILE."
+            )
         logger.info("using accelerator.device=%s", self.accelerator.device)
         worker_init_fn = set_global_seed(self.seed, get_worker_init_fn=True)
         self._assert_dataset_length_consistent(self.train_dataset, "train_dataset")
@@ -179,6 +215,7 @@ class Wan22Trainer:
             num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
             worker_init_fn=worker_init_fn,
+            multiprocessing_context="spawn",
         )
 
     def _assert_dataset_length_consistent(self, dataset, dataset_name: str):

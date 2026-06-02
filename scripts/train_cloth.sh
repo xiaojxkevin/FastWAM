@@ -9,8 +9,8 @@ export PYTHONFAULTHANDLER=1
 export TORCH_SHOW_CPP_STACKTRACES=1
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
 # export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export NCCL_DEBUG=INFO
-export NCCL_DEBUG_SUBSYS=INIT,NET,COLL
+# export NCCL_DEBUG=INFO
+# export NCCL_DEBUG_SUBSYS=INIT,NET,COLL
 
 # ========================================================
 # Proxy (platform internal network)
@@ -24,10 +24,6 @@ export https_proxy=http://10.2.83.188:3128
 export WANDB_API_KEY="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"
 
 # ========================================================
-# HuggingFace & Model cache → all under ./.cache/
-# ========================================================
-export HF_HOME="./.cache/hf"
-
 # DiffSynth / Wan2.2 model weights
 export DIFFSYNTH_MODEL_BASE_PATH="./checkpoints"
 export DIFFSYNTH_DOWNLOAD_SOURCE="huggingface"
@@ -49,6 +45,22 @@ mkdir -p $TRITON_CACHE_DIR $TORCH_EXTENSIONS_DIR $NUMBA_CACHE_DIR
 # Working directory & conda environment
 # ========================================================
 cd /workspace/mnt/sealab/xiaojx/FastWAM
+
+# ========================================================
+# HuggingFace cache
+# ========================================================
+# HUB / model-weight cache → persisted under project root (shared NFS is fine for reads).
+export HF_HOME="${PWD}/.cache/hf"
+export HUGGINGFACE_HUB_CACHE="${HF_HOME}/hub"
+
+# LeRobot metadata cache → persisted under project root.
+export HF_LEROBOT_HOME="${HF_HOME}/lerobot"
+
+# Datasets cache → MUST be on LOCAL (non-NFS) storage, otherwise the
+# filelock used by `datasets.load_dataset` hits ESTALE on shared NFS.
+export HF_DATASETS_CACHE="${HF_DATASETS_CACHE:-/tmp/hf_datasets_cache}"
+
+mkdir -p "${HF_HOME}" "${HUGGINGFACE_HUB_CACHE}" "${HF_DATASETS_CACHE}" "${HF_LEROBOT_HOME}"
 
 source /opt/conda/etc/profile.d/conda.sh
 conda activate fastwam
@@ -126,14 +138,13 @@ echo "[start] host=$(hostname) time=$(date -Is)"
 export RUN_ID="run_job_${DLB_JOB_ID:-$(date +%Y-%m-%d-%H)}"
 
 # ========================================================
-# Launch training via train_zero1.sh
+# Launch training via train_zero1_yidongyun.sh (torchrun)
 #
-# train_zero1.sh handles:
-#   - Multi-node RUN_ID synchronisation (TCPStore)
-#   - accelerate launch with DeepSpeed ZeRO-1
-#   - output_dir = ./runs/<task_basename>/<run_id>
+# Same launcher as train_depth.sh / train_ori_robotwin_multi.sh.
+# Uses torchrun + ACCELERATE_USE_DEEPSPEED for proper
+# multi-node DeepSpeed ZeRO-1 training.
 # ========================================================
-bash scripts/train_zero1.sh "${NPROC_PER_NODE}" \
+bash scripts/train_zero1_yidongyun.sh "${NPROC_PER_NODE}" \
     task=cloth_folding_3cam_384_1e-4 \
     wandb.enabled=true \
     wandb.project=fastwam-cloth-fold \

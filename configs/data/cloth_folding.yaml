@@ -1,7 +1,7 @@
 train:
   _target_: fastwam.datasets.lerobot.robot_video_dataset.RobotVideoDataset
   dataset_dirs:
-    - ./cloth-fold/0321_merge_dagger_anno
+    - /workspace/mnt/data/sealab/cloth-fold/0321_merge_dagger_anno
   shape_meta:
     images:
       - key: fixed_front

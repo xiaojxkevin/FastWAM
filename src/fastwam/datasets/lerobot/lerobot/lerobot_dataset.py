@@ -491,7 +491,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 raise FileNotFoundError
             assert all((self.root / fpath).is_file() for fpath in self.get_episodes_file_paths())
             self.hf_dataset = self.load_hf_dataset()
-        except (AssertionError, FileNotFoundError, NotADirectoryError):
+        except (AssertionError, NotADirectoryError):
             # self.revision = get_safe_version(self.repo_id, self.revision)
             self.revision = CODEBASE_VERSION
             self.download_episodes(download_videos)

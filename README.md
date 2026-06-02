@@ -15,15 +15,25 @@ This repository contains the training and evaluation code for FastWAM on LIBERO 
 
 ## Index
 
-- [File Structure](#file-structure)
-- [Environment Setup](#environment-setup)
-- [Model Preparation](#model-preparation)
-- [Dataset Download](#dataset-download)
-- [Inference with Released Checkpoints](#inference-with-released-checkpoints)
-- [Training](#training)
-- [Inference with Your Trained Checkpoints](#inference-with-your-trained-checkpoints)
-- [Acknowledgements](#acknowledgements)
-- [BibTeX](#bibtex)
+- [FastWAM](#fastwam)
+  - [Index](#index)
+  - [File Structure](#file-structure)
+  - [Environment Setup](#environment-setup)
+  - [Model Preparation](#model-preparation)
+  - [Dataset Download](#dataset-download)
+    - [LIBERO](#libero)
+    - [RoboTwin](#robotwin)
+  - [Inference with Released Checkpoints](#inference-with-released-checkpoints)
+  - [Training](#training)
+    - [1) Precompute T5 embedding cache before training](#1-precompute-t5-embedding-cache-before-training)
+    - [2) Training (using `fastwam` as an example)](#2-training-using-fastwam-as-an-example)
+    - [Cloth Folding](#cloth-folding)
+      - [1) Prepare the dataset](#1-prepare-the-dataset)
+      - [2) Precompute T5 embedding cache](#2-precompute-t5-embedding-cache)
+      - [3) Launch training](#3-launch-training)
+  - [Inference with Your Trained Checkpoints](#inference-with-your-trained-checkpoints)
+  - [Acknowledgements](#acknowledgements)
+  - [BibTeX](#bibtex)
 
 ## File Structure
 
@@ -59,6 +69,14 @@ pip install -U pip
 pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
 pip install -e .
 ```
+
+**FFmpeg** is required for efficient video decoding (torchcodec backend). Install it via your system package manager:
+
+```bash
+sudo apt install -y ffmpeg
+```
+
+Without FFmpeg, video decoding falls back to a slower pyav path that may cause memory issues with large datasets.
 
 ## Model Preparation
 
@@ -257,6 +275,53 @@ bash scripts/train_zero1.sh 8 task=robotwin_uncond_3cam_384_1e-4
 ```
 
 For LIBERO, we train on a single node with 8 GPUs. For RoboTwin, we use 64 GPUs to accelerate training. You can try reducing the GPU count or training epochs.
+
+### Cloth Folding
+
+The Cloth Folding dataset is a custom multi-camera video dataset (3 cameras, 480×640, AV1-encoded).
+
+**Prerequisites:** FFmpeg must be installed (see [Environment Setup](#environment-setup)), otherwise the video decoding backend cannot use torchcodec and will fall back to a slower, more memory-intensive pyav path.
+
+#### 1) Prepare the dataset
+
+Place the Cloth Folding dataset under a path accessible to all training nodes, for example:
+
+```text
+/workspace/mnt/data/sealab/cloth-fold/0321_merge_dagger_anno/
+├── data/
+├── meta/
+└── videos/
+```
+
+The dataset path is configured in [`configs/data/cloth_folding.yaml`](./configs/data/cloth_folding.yaml) via the `dataset_dirs` field.
+
+A precomputed `dataset_stats.json` should already be present in the dataset directory. If not, set `pretrained_norm_stats` to `null` in the data config for the first run to auto-compute statistics.
+
+#### 2) Precompute T5 embedding cache
+
+```bash
+python scripts/precompute_text_embeds.py task=cloth_folding_3cam_384_1e-4
+```
+
+For multi-GPU:
+
+```bash
+torchrun --standalone --nproc_per_node=8 scripts/precompute_text_embeds.py task=cloth_folding_3cam_384_1e-4
+```
+
+#### 3) Launch training
+
+Single-node (8 GPUs):
+
+```bash
+NNODES=1 bash scripts/train_cloth.sh
+```
+
+Multi-node (e.g., 2 nodes × 8 GPUs):
+
+```bash
+NNODES=2 bash scripts/train_cloth.sh
+```
 
 ## Inference with Your Trained Checkpoints
 
