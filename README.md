@@ -68,6 +68,7 @@ conda activate fastwam
 pip install -U pip
 pip install torch==2.7.1+cu128 torchvision==0.22.1+cu128 --extra-index-url https://download.pytorch.org/whl/cu128
 pip install -e .
+pip install websockets
 ```
 
 **FFmpeg** is required for efficient video decoding (torchcodec backend). Install it via your system package manager:

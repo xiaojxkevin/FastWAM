@@ -13,18 +13,20 @@ host: "0.0.0.0"
 port: 8765
 
 # ---- Checkpoint -----------------------------------------------------
-checkpoint_path: "./pretrained/step_017500.pt"
-model_dtype: "bf16"        # bf16 | fp16 | no
+checkpoint_path: "/workspace/mnt/sealab/xiaojx/FastWAM/runs/cloth_folding_3cam_384_1e-4/run_job_2026-06-03-02/checkpoints/weights/step_017500.pt"
+model_dtype: "bf16" # bf16 | fp16 | no
 device: "cuda"
 
 # ---- Model parameters (mirrors configs/model/fastwam.yaml) ----------
 # NOTE: load_text_encoder MUST be true for infer_action (uses encode_prompt).
+#       Set to false to use precomputed text embeddings from cache (saves ~9 GB GPU memory).
+#       When false, `data.text_embedding_cache_dir` must point to a valid cache directory.
 # NOTE: mot_checkpoint_mixed_attn is false per cloth task override.
 model:
   model_id: "Wan-AI/Wan2.2-TI2V-5B"
   tokenizer_model_id: "Wan-AI/Wan2.1-T2V-1.3B"
   tokenizer_max_len: 128
-  load_text_encoder: true
+  load_text_encoder: false  # cache mode: use precomputed text embeddings to save ~9GB GPU memory
   proprio_dim: 14
   mot_checkpoint_mixed_attn: false
   action_dit_pretrained_path: "checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt"
@@ -80,7 +82,7 @@ model:
 
 # ---- Data processing (mirrors configs/data/cloth_folding.yaml) ------
 data:
-  dataset_stats_path: "./pretrained/dataset_stats.json"
+  dataset_stats_path: "/workspace/mnt/sealab/xiaojx/FastWAM/runs/cloth_folding_3cam_384_1e-4/run_job_2026-06-03-02/dataset_stats.json"
   shape_meta:
     images:
       - key: fixed_front
@@ -105,9 +107,11 @@ data:
   action_output_dim: 14
   proprio_output_dim: 14
   norm_default_mode: "z-score"
+  text_embedding_cache_dir: "./data/text_embeds_cache/cloth_folding"
+  context_len: 128
 
 # ---- Inference hyperparameters --------------------------------------
 inference:
-  action_horizon: 32        # num_frames - 1 = 32
-  num_inference_steps: 20   # diffusion denoising steps
-  seed: null                # null = random each request
+  action_horizon: 32 # num_frames - 1 = 32
+  num_inference_steps: 10 # diffusion denoising steps
+  seed: null # null = random each request

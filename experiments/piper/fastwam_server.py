@@ -30,12 +30,19 @@ References
 """
 
 import asyncio
+import hashlib
 import http
 import logging
+import sys
 import time
 import traceback
 from pathlib import Path
 from typing import Any, Optional
+
+# Project root for resolving relative paths in config values (e.g. cache dir).
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
 
 import numpy as np
 import torch
@@ -128,6 +135,31 @@ class FastWAMModelWrapper:
         dataset_stats = load_dataset_stats_from_json(str(stats_path))
         self._processor.set_normalizer_from_stats(dataset_stats)
 
+        # --- text context mode ------------------------------------------------
+        self._text_encoder_loaded = bool(model_cfg.get("load_text_encoder", True))
+        self._text_cache_dir: Optional[Path] = None
+        self._context_len: int = int(model_cfg.get("tokenizer_max_len", 128))
+        self._text_context_cache: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+
+        if not self._text_encoder_loaded:
+            cache_dir_str = data_cfg.get("text_embedding_cache_dir", "")
+            if not cache_dir_str:
+                raise ValueError(
+                    "`data.text_embedding_cache_dir` is required when `load_text_encoder=false`. "
+                    "Provide the path to precomputed T5 text embedding cache files."
+                )
+            self._text_cache_dir = Path(cache_dir_str)
+            if not self._text_cache_dir.is_absolute():
+                self._text_cache_dir = _PROJECT_ROOT / self._text_cache_dir
+            if not self._text_cache_dir.is_dir():
+                raise FileNotFoundError(
+                    f"Text embedding cache directory not found: {self._text_cache_dir}. "
+                    "Run `scripts/precompute_text_embeds.py` first, or set `load_text_encoder=true`."
+                )
+            logger.info("Text context mode: cache (dir=%s)", self._text_cache_dir)
+        else:
+            logger.info("Text context mode: online encoder")
+
         # --- inference params ------------------------------------------------
         self._action_horizon = int(inf_cfg.get("action_horizon", 32))
         self._num_inference_steps = int(inf_cfg.get("num_inference_steps", 20))
@@ -197,6 +229,63 @@ class FastWAMModelWrapper:
         return denorm.numpy()
 
     # -------------------------------------------------------------------
+    # Text context (cache or online encoder)
+    # -------------------------------------------------------------------
+
+    def _get_text_context(self, prompt: str) -> tuple[Optional[str], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Return ``(prompt, context, context_mask)`` for ``infer_action``.
+
+        When ``load_text_encoder=true``: ``prompt`` is returned as-is,
+        ``context``/``context_mask`` are ``None``.  ``infer_action`` will
+        call ``encode_prompt`` online.
+
+        When ``load_text_encoder=false``: ``prompt`` is ``None``, and
+        precomputed ``context``/``context_mask`` tensors are loaded from
+        the disk cache (SHA‑256 hashed filename, same naming convention as
+        ``scripts/precompute_text_embeds.py``).
+        """
+        if self._text_encoder_loaded:
+            return prompt, None, None
+
+        # Check in‑memory cache first.
+        cached = self._text_context_cache.get(prompt)
+        if cached is not None:
+            return None, cached[0], cached[1]
+
+        # Load from disk.
+        assert self._text_cache_dir is not None
+        hashed = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        cache_file = self._text_cache_dir / f"{hashed}.t5_len{self._context_len}.wan22ti2v5b.pt"
+        if not cache_file.exists():
+            raise FileNotFoundError(
+                f"Text embedding cache not found for prompt {prompt!r}. "
+                f"Expected: {cache_file}. "
+                "Run `scripts/precompute_text_embeds.py` for this prompt, "
+                "or set `load_text_encoder=true` in the server config."
+            )
+
+        payload = torch.load(cache_file, map_location="cpu", weights_only=False)
+        context = payload["context"]   # [L, D]
+        mask = payload["mask"]          # [L]
+
+        if context.ndim != 2:
+            raise ValueError(f"Cached context must be 2D [L,D], got {tuple(context.shape)}")
+        if mask.ndim != 1:
+            raise ValueError(f"Cached mask must be 1D [L], got {tuple(mask.shape)}")
+
+        # Match fourier convention: zero out padded rows, then set full‑True mask.
+        context = context.clone()
+        context[~mask] = 0.0
+        mask_ones = torch.ones_like(mask, dtype=torch.bool)
+
+        # Add batch dim: [1, L, D] and [1, L]
+        context = context.unsqueeze(0)
+        mask_ones = mask_ones.unsqueeze(0)
+
+        self._text_context_cache[prompt] = (context, mask_ones)
+        return None, context, mask_ones
+
+    # -------------------------------------------------------------------
     # Inference
     # -------------------------------------------------------------------
 
@@ -215,13 +304,17 @@ class FastWAMModelWrapper:
         """
         image_tensor = self._preprocess_images(observation["images"])
         proprio = self._normalize_state(observation["state"])
-        prompt = DEFAULT_PROMPT.format(task=observation.get("prompt", "Fold the cloth."))
+        prompt = DEFAULT_PROMPT.format(task=observation.get("prompt", "take the cloth from the basket and fold the cloth."))
+
+        infer_prompt, context, context_mask = self._get_text_context(prompt)
 
         seed = self._seed
         infer_t0 = time.perf_counter()
         with torch.no_grad():
             pred = self._model.infer_action(
-                prompt=prompt,
+                prompt=infer_prompt,
+                context=context,
+                context_mask=context_mask,
                 input_image=image_tensor,
                 action_horizon=self._action_horizon,
                 proprio=proprio,
