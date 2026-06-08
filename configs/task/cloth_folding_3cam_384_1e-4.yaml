@@ -11,6 +11,8 @@ num_workers: 8
 
 model:
   mot_checkpoint_mixed_attn: false
+  video_dit_config:
+    num_input_frames: 9  # 8 history + 1 current = 9 conditioning video frames
 
 # scheduler
 lr_scheduler_type: "cosine"

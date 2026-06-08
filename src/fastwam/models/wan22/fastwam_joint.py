@@ -162,8 +162,9 @@ class FastWAMJoint(FastWAM):
         ).to(device=self.device, dtype=self.torch_dtype)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
-        latents_video[:, :, 0:1] = first_frame_latents.clone()
+        condition_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        K_cond = condition_latents.shape[2]  # number of condition latent frames
+        latents_video[:, :, 0:K_cond] = condition_latents.clone()
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None
@@ -229,7 +230,7 @@ class FastWAMJoint(FastWAM):
 
             latents_video = self.infer_video_scheduler.step(pred_video_posi, step_delta_video, latents_video)
             latents_action = self.infer_action_scheduler.step(pred_action_posi, step_delta_action, latents_action)
-            latents_video[:, :, 0:1] = first_frame_latents.clone()
+            latents_video[:, :, 0:K_cond] = condition_latents.clone()
 
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),

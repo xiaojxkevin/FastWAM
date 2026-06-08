@@ -26,6 +26,7 @@ video_dit_config:
   require_clip_embedding: false
   require_vae_embedding: false
   fuse_vae_embedding_in_latents: true
+  num_input_frames: 1  # number of conditioning video frames (history + current), default 1 = single-frame conditioning
   use_gradient_checkpointing: ${model.mot_checkpoint_mixed_attn}
   video_attention_mask_mode: "first_frame_causal" # default
   action_conditioned: false

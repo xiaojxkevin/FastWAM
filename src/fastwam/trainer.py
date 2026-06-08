@@ -433,7 +433,13 @@ class Wan22Trainer:
         video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
         action = sample["action"][0] if "action" in sample and sample["action"] is not None else None
         proprio = sample["proprio"][0, 0] if "proprio" in sample and sample["proprio"] is not None else None # from [1, T, d] to [d]
-        input_image = video0[:, 0].unsqueeze(0)
+        # Support multi-frame conditioning: extract first N frames as input
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        num_input = getattr(unwrapped, "num_input_frames", 1)
+        if num_input == 1:
+            input_image = video0[:, 0].unsqueeze(0)  # [3, H, W] -> [1, 3, H, W]
+        else:
+            input_image = video0[:, :num_input].unsqueeze(0)  # [3, N, H, W] -> [1, 3, N, H, W]
         _, num_frames, _, _ = video0.shape
 
         # 2. inference and video saving

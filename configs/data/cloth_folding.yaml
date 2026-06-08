@@ -22,6 +22,7 @@ train:
         raw_shape: 14
         shape: 14
   num_frames: 33
+  num_history_raw_frames: 32  # 8 history video frames × stride 4, loaded before the current observation
   global_sample_stride: 1
   action_video_freq_ratio: 4
   video_size: [384, 320]

@@ -38,6 +38,7 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        num_input_frames: int = 1,
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -84,6 +85,11 @@ class FastWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+
+        # Multi-frame conditioning: number of conditioning video frames in pixel space
+        self.num_input_frames = int(num_input_frames)
+        # Number of conditioning latent frames (VAE temporal downsample factor = 4)
+        self.num_condition_latent_frames = (self.num_input_frames - 1) // 4 + 1
 
         self.to(self.device)
 
@@ -149,6 +155,7 @@ class FastWAM(torch.nn.Module):
             mot_checkpoint_mixed_attn=mot_checkpoint_mixed_attn,
         )
 
+        num_input_frames = int(video_dit_config.get("num_input_frames", 1))
         model = cls(
             video_expert=video_expert,
             action_expert=action_expert,
@@ -168,6 +175,7 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            num_input_frames=num_input_frames,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -254,15 +262,38 @@ class FastWAM(torch.nn.Module):
     def _encode_input_image_latents_tensor(self, input_image: torch.Tensor, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+        # Support multi-frame input: [1, 3, N, H, W] or [1, 3, H, W]
+        if input_image.ndim == 5:
+            # Multi-frame: [1, 3, N, H, W]
+            if input_image.shape[0] != 1 or input_image.shape[1] != 3:
+                raise ValueError(
+                    f"Multi-frame `input_image` must have shape [1,3,N,H,W], got {tuple(input_image.shape)}"
+                )
+            N = input_image.shape[2]
+            if N % 4 != 1:
+                raise ValueError(
+                    f"Multi-frame input T must satisfy T % 4 == 1 (VAE constraint), got T={N}"
+                )
+            image = input_image.to(device=self.device)[0]  # [3, N, H, W]
+            z = self.vae.encode([image], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+            if isinstance(z, list):
+                z = z[0].unsqueeze(0)
+            return z
+        elif input_image.ndim == 4:
+            # Single-frame: [1, 3, H, W] (unchanged behavior)
+            if input_image.shape[0] != 1 or input_image.shape[1] != 3:
+                raise ValueError(
+                    f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                )
+            image = input_image.to(device=self.device)[0].unsqueeze(1)  # [3, 1, H, W]
+            z = self.vae.encode([image], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
+            if isinstance(z, list):
+                z = z[0].unsqueeze(0)
+            return z
+        else:
             raise ValueError(
-                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                f"`input_image` must have shape [1,3,N,H,W] (multi-frame), [1,3,H,W] (single-frame), or [3,H,W], got {tuple(input_image.shape)}"
             )
-        image = input_image.to(device=self.device)[0].unsqueeze(1)
-        z = self.vae.encode([image], device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
-        if isinstance(z, list):
-            z = z[0].unsqueeze(0)
-        return z
 
     def _decode_latents(self, latents, tiled=False, tile_size=(30, 52), tile_stride=(15, 26)):
         video_tensor = self.vae.decode(latents, device=self.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride)
@@ -338,9 +369,11 @@ class FastWAM(torch.nn.Module):
         input_latents = self._encode_video_latents(input_video, tiled=tiled)
 
         first_frame_latents = None
+        condition_latents = None
         fuse_flag = False
         if getattr(self.video_expert, "fuse_vae_embedding_in_latents", False):
-            first_frame_latents = input_latents[:, :, 0:1]
+            K = self.num_condition_latent_frames
+            condition_latents = input_latents[:, :, 0:K]
             fuse_flag = True
 
         if context.ndim != 3 or context_mask.ndim != 2:
@@ -375,7 +408,8 @@ class FastWAM(torch.nn.Module):
             "context": context,
             "context_mask": context_mask,
             "input_latents": input_latents,
-            "first_frame_latents": first_frame_latents,
+            "first_frame_latents": condition_latents[:, :, 0:1] if condition_latents is not None else None,
+            "condition_latents": condition_latents,
             "fuse_vae_embedding_in_latents": fuse_flag,
             "action": action,
             "action_is_pad": action_is_pad,
@@ -389,6 +423,7 @@ class FastWAM(torch.nn.Module):
         action_seq_len: int,
         video_tokens_per_frame: int,
         device: torch.device,
+        num_condition_latent_frames: int = 1,
     ) -> torch.Tensor:
         total_seq_len = video_seq_len + action_seq_len
         mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
@@ -401,9 +436,9 @@ class FastWAM(torch.nn.Module):
         )
         # action -> action
         mask[video_seq_len:, video_seq_len:] = True
-        # action -> first-frame video only
-        first_frame_tokens = min(video_tokens_per_frame, video_seq_len)
-        mask[video_seq_len:, :first_frame_tokens] = True
+        # action -> condition-frame video
+        condition_tokens = min(num_condition_latent_frames * video_tokens_per_frame, video_seq_len)
+        mask[video_seq_len:, :condition_tokens] = True
         return mask
 
     def _compute_video_loss_per_sample(
@@ -464,8 +499,9 @@ class FastWAM(torch.nn.Module):
         latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
         target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
 
-        if inputs["first_frame_latents"] is not None:
-            latents[:, :, 0:1] = inputs["first_frame_latents"]
+        if inputs["condition_latents"] is not None:
+            K = self.num_condition_latent_frames
+            latents[:, :, 0:K] = inputs["condition_latents"]
 
         noise_action = torch.randn_like(action)
         timestep_action = self.train_action_scheduler.sample_training_t(
@@ -500,6 +536,7 @@ class FastWAM(torch.nn.Module):
             action_seq_len=action_tokens.shape[1],
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_tokens.device,
+            num_condition_latent_frames=self.num_condition_latent_frames,
         )
         tokens_out = self.mot(
             embeds_all={
@@ -531,10 +568,11 @@ class FastWAM(torch.nn.Module):
 
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
-        include_initial_video_step = inputs["first_frame_latents"] is None
-        if inputs["first_frame_latents"] is not None:
-            pred_video = pred_video[:, :, 1:]
-            target_video = target_video[:, :, 1:]
+        include_initial_video_step = inputs["condition_latents"] is None
+        if inputs["condition_latents"] is not None:
+            K = self.num_condition_latent_frames
+            pred_video = pred_video[:, :, K:]
+            target_video = target_video[:, :, K:]
 
         loss_video_per_sample = self._compute_video_loss_per_sample(
             pred_video=pred_video,
@@ -599,6 +637,7 @@ class FastWAM(torch.nn.Module):
             action_seq_len=action_pre["tokens"].shape[1],
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_pre["tokens"].device,
+            num_condition_latent_frames=self.num_condition_latent_frames,
         )
 
         tokens_out = self.mot(
@@ -662,6 +701,7 @@ class FastWAM(torch.nn.Module):
             action_seq_len=action_pre["tokens"].shape[1],
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_pre["tokens"].device,
+            num_condition_latent_frames=self.num_condition_latent_frames,
         )
         tokens_out = self.mot(
             embeds_all={
@@ -762,11 +802,25 @@ class FastWAM(torch.nn.Module):
         
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+        if input_image.ndim == 4:
+            # Single-frame: [1, 3, H, W]
+            if input_image.shape[0] != 1 or input_image.shape[1] != 3:
+                raise ValueError(
+                    f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                )
+            _, _, height, width = input_image.shape
+            num_input_pixel_frames = 1
+        elif input_image.ndim == 5:
+            # Multi-frame: [1, 3, N, H, W]
+            if input_image.shape[0] != 1 or input_image.shape[1] != 3:
+                raise ValueError(
+                    f"Multi-frame `input_image` must have shape [1,3,N,H,W], got {tuple(input_image.shape)}"
+                )
+            _, _, num_input_pixel_frames, height, width = input_image.shape
+        else:
             raise ValueError(
-                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                f"`input_image` must have shape [1,3,H,W], [1,3,N,H,W], or [3,H,W], got {tuple(input_image.shape)}"
             )
-        _, _, height, width = input_image.shape
         checked_h, checked_w, checked_t = self._check_resize_height_width(height, width, num_video_frames)
         if (checked_h, checked_w) != (height, width):
             raise ValueError(
@@ -818,8 +872,9 @@ class FastWAM(torch.nn.Module):
         ).to(device=self.device, dtype=self.torch_dtype)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
-        latents_video[:, :, 0:1] = first_frame_latents.clone()
+        condition_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        K_cond = condition_latents.shape[2]  # number of condition latent frames
+        latents_video[:, :, 0:K_cond] = condition_latents.clone()
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None
@@ -887,7 +942,7 @@ class FastWAM(torch.nn.Module):
 
             latents_video = self.infer_video_scheduler.step(pred_video, step_delta_video, latents_video)
             latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
-            latents_video[:, :, 0:1] = first_frame_latents.clone()
+            latents_video[:, :, 0:K_cond] = condition_latents.clone()
 
         action_out = latents_action[0].detach().to(device="cpu", dtype=torch.float32)
         if test_action_with_infer_action:
@@ -1009,6 +1064,7 @@ class FastWAM(torch.nn.Module):
             action_seq_len=latents_action.shape[1],
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_pre["tokens"].device,
+            num_condition_latent_frames=self.num_condition_latent_frames,
         )
         video_kv_cache = self.mot.prefill_video_cache(
             video_tokens=video_pre["tokens"],

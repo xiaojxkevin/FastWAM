@@ -75,8 +75,9 @@ class FastWAMIDM(FastWAMJoint):
         )
         latents_noisy = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
         target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
-        if inputs["first_frame_latents"] is not None:
-            latents_noisy[:, :, 0:1] = inputs["first_frame_latents"]
+        if inputs["condition_latents"] is not None:
+            K = self.num_condition_latent_frames
+            latents_noisy[:, :, 0:K] = inputs["condition_latents"]
 
         # Branch B: noisy action.
         noise_action = torch.randn_like(action)
@@ -106,9 +107,10 @@ class FastWAMIDM(FastWAMJoint):
             )
             cond_noise_selector = cond_noise_mask.view(batch_size, 1, 1, 1, 1)
             latents_cond = torch.where(cond_noise_selector, latents_cond_noisy, input_latents)
-        if inputs["first_frame_latents"] is not None:
+        if inputs["condition_latents"] is not None:
+            K = self.num_condition_latent_frames
             latents_cond = latents_cond.clone()
-            latents_cond[:, :, 0:1] = inputs["first_frame_latents"]
+            latents_cond[:, :, 0:K] = inputs["condition_latents"]
 
         video_pre_noisy = self.video_expert.pre_dit(
             x=latents_noisy,
@@ -190,10 +192,11 @@ class FastWAMIDM(FastWAMJoint):
         pred_video = self.video_expert.post_dit(pred_video_tokens, video_pre_noisy)
         pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
 
-        include_initial_video_step = inputs["first_frame_latents"] is None
-        if inputs["first_frame_latents"] is not None:
-            pred_video = pred_video[:, :, 1:]
-            target_video = target_video[:, :, 1:]
+        include_initial_video_step = inputs["condition_latents"] is None
+        if inputs["condition_latents"] is not None:
+            K = self.num_condition_latent_frames
+            pred_video = pred_video[:, :, K:]
+            target_video = target_video[:, :, K:]
 
         loss_video_per_sample = self._compute_video_loss_per_sample(
             pred_video=pred_video,
@@ -344,8 +347,9 @@ class FastWAMIDM(FastWAMJoint):
         ).to(device=self.device, dtype=self.torch_dtype)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
-        latents_video[:, :, 0:1] = first_frame_latents.clone()
+        condition_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        K_cond = condition_latents.shape[2]  # number of condition latent frames
+        latents_video[:, :, 0:K_cond] = condition_latents.clone()
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None
@@ -395,7 +399,7 @@ class FastWAMIDM(FastWAMJoint):
                 fuse_vae_embedding_in_latents=fuse_flag,
             )
             latents_video = self.infer_video_scheduler.step(pred_video, step_delta_video, latents_video)
-            latents_video[:, :, 0:1] = first_frame_latents.clone()
+            latents_video[:, :, 0:K_cond] = condition_latents.clone()
 
         # Stage 2: freeze denoised video as cond and denoise action via video K/V cache.
         timestep_video_cond = torch.zeros(

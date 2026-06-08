@@ -335,6 +335,7 @@ class WanVideoDiT(torch.nn.Module):
         action_group_causal_mask_mode = "causal",
         video_attention_mask_mode: str = "bidirectional",
         use_gradient_checkpointing: bool = False,
+        num_input_frames: int = 1,
     ):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -348,6 +349,8 @@ class WanVideoDiT(torch.nn.Module):
         self.require_clip_embedding = require_clip_embedding
         self.fuse_vae_embedding_in_latents = fuse_vae_embedding_in_latents
         self.video_attention_mask_mode = str(video_attention_mask_mode)
+        self.num_input_frames = int(num_input_frames)
+        self.num_condition_latent_frames = (self.num_input_frames - 1) // 4 + 1
 
         if num_heads <= 0:
             raise ValueError(f"`num_heads` must be > 0, got {num_heads}")
@@ -543,7 +546,9 @@ class WanVideoDiT(torch.nn.Module):
                 dtype=timestep.dtype,
                 device=timestep.device,
             ) * timestep.view(batch_size, 1, 1)
-            token_timesteps[:, 0, :] = 0
+            # Set condition latent frames to t=0 (never noised)
+            K_cond = self.num_condition_latent_frames
+            token_timesteps[:, :K_cond, :] = 0
             token_timesteps = token_timesteps.reshape(batch_size, -1)
             token_t_emb = sinusoidal_embedding_1d(self.freq_dim, token_timesteps.reshape(-1))
             t = self.time_embedding(token_t_emb).reshape(batch_size, -1, self.hidden_dim)
@@ -565,8 +570,9 @@ class WanVideoDiT(torch.nn.Module):
             action_emb = action_emb + action_pos_embed.unsqueeze(0) # (B, action_len, dim)
             context = torch.cat([context, action_emb], dim=1) # (B, context_len + action_len, dim)
 
-            # new mask
-            num_temporal_groups = f - 1 # first latent frame do not attend to actions
+            # new mask — condition latent frames do not attend to actions
+            K_cond = self.num_condition_latent_frames
+            num_temporal_groups = f - K_cond
             if num_temporal_groups <= 0:
                 raise ValueError(
                     "Action-conditioned context mask requires at least 2 latent frames when `action` is provided."
@@ -585,8 +591,9 @@ class WanVideoDiT(torch.nn.Module):
             final_context_mask = torch.zeros((batch_size, seq_len, context.shape[1]), dtype=torch.bool, device=context.device) # (B, seq_len, L + action_len)
             # all latent frames attend to text tokens
             final_context_mask[:, :, :context_len] = context_mask.unsqueeze(1).expand(-1, seq_len, -1) # (B, seq_len, L)
-            # latent frames from the 2nd one attend to action tokens
-            final_context_mask[:, tokens_per_frame:, context_len:] = action_group_mask.unsqueeze(0).expand(batch_size, -1, -1) # (B, seq_len, action_len)
+            # latent frames after condition frames attend to action tokens
+            cond_tokens = K_cond * tokens_per_frame
+            final_context_mask[:, cond_tokens:, context_len:] = action_group_mask.unsqueeze(0).expand(batch_size, -1, -1) # (B, seq_len, action_len)
             context_mask = final_context_mask
         elif self.action_conditioned and action is None:
             if f != 1:

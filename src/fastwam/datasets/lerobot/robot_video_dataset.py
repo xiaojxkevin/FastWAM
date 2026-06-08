@@ -38,29 +38,34 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         is_training_set=False,
         global_sample_stride=1,
         action_video_freq_ratio: int = 1,
+        num_history_raw_frames: int = 0,
         skip_padding_as_possible: bool = False,
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
     ):
+        self.num_frames = num_frames
+        self.num_history_raw_frames = num_history_raw_frames
+        total_num_frames = num_frames + num_history_raw_frames
+
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
-            obs_size=num_frames,
-            action_size=num_frames - 1,
+            obs_size=total_num_frames,
+            action_size=total_num_frames - 1,
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
             global_sample_stride=global_sample_stride,
         )
-    
-        self.num_frames = num_frames
+
         self.action_video_freq_ratio = action_video_freq_ratio
-        
-        assert (num_frames - 1) % self.action_video_freq_ratio == 0, \
-            f"num_frames-1 must be divisible by action_video_freq_ratio, got {num_frames - 1} and {self.action_video_freq_ratio}"
-        assert ((num_frames - 1) // self.action_video_freq_ratio) % 4 == 0, \
-            f"video frames must be divisible by 4 for tokenization, got {(num_frames - 1) // self.action_video_freq_ratio}"
-        self.video_sample_indices = list(range(0, num_frames, self.action_video_freq_ratio))
+
+        num_video_frames = (total_num_frames - 1) // self.action_video_freq_ratio + 1
+        assert (total_num_frames - 1) % self.action_video_freq_ratio == 0, \
+            f"total_num_frames-1 must be divisible by action_video_freq_ratio, got {total_num_frames - 1} and {self.action_video_freq_ratio}"
+        assert (num_video_frames - 1) % 4 == 0, \
+            f"video_frames-1 must be divisible by 4 for VAE temporal downsampling, got {num_video_frames - 1}"
+        self.video_sample_indices = list(range(0, total_num_frames, self.action_video_freq_ratio))
 
         self.camera_key = camera_key
         self.lerobot_dataset._set_return_images(True)
@@ -196,11 +201,21 @@ class RobotVideoDataset(torch.utils.data.Dataset):
 
         video = video.permute(1, 0, 2, 3) # [C, T_video, H, W], range [-1, 1]
 
-        # Proxy (from lerobot): 
+        # Proxy (from lerobot):
         #   action: [num_frames-1, action_dim] # start from t0, except the last frame
         #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
-        action = sample["action"] # [T-1, action_dim]
-        proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
+        action = sample["action"] # [total_num_frames-1, action_dim]
+        proprio = sample["proprio"][:-1, :] # [total_num_frames-1, state_dim]， to align with action
+
+        # Slice to keep only future actions/proprio (after history frames)
+        if self.num_history_raw_frames > 0:
+            action = action[self.num_history_raw_frames:, :]            # [32, action_dim]
+            proprio = proprio[self.num_history_raw_frames:, :]          # [32, state_dim]
+            action_is_pad = sample["action_is_pad"][self.num_history_raw_frames:, :]
+            proprio_is_pad = sample["proprio_is_pad"][self.num_history_raw_frames:, :]
+        else:
+            action_is_pad = sample["action_is_pad"]
+            proprio_is_pad = sample["proprio_is_pad"]
         if video.shape[1] <= 1:
             raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
         if action.shape[0] % (video.shape[1] - 1) != 0:
@@ -228,8 +243,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "context": context,
             "context_mask": context_mask,
             "image_is_pad": image_is_pad,
-            "action_is_pad": sample["action_is_pad"],
-            "proprio_is_pad": sample["proprio_is_pad"],
+            "action_is_pad": action_is_pad,
+            "proprio_is_pad": proprio_is_pad,
         }
         return data
 
