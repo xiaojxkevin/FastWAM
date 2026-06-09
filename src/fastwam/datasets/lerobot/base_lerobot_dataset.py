@@ -35,8 +35,10 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         global_sample_stride: int = 1,
     ):
         assert len(dataset_dirs) > 0, "At least one dataset directory is required"
-        assert past_action_size == 0
-        assert past_obs_size == 0
+        # NOTE: past_obs_size and past_action_size can be non-zero to support
+        # history frames that precede the current observation. The delta_timestamps
+        # formula (range(-past_*, -past_* + total)) already handles negative offsets.
+        # Total observation/action counts are still obs_size and action_size.
         assert action_size == obs_size - 1, "In this dataset, action_size should be obs_size - 1"
         
         self.dataset_dirs = dataset_dirs

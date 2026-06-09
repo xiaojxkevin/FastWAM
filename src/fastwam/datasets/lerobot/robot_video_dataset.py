@@ -51,7 +51,9 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
             shape_meta=OmegaConf.to_container(shape_meta, resolve=True),
+            past_obs_size=num_history_raw_frames,
             obs_size=total_num_frames,
+            past_action_size=num_history_raw_frames,
             action_size=total_num_frames - 1,
             val_set_proportion=val_set_proportion,
             is_training_set=is_training_set,
@@ -90,6 +92,10 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         if processor is not None:
             if isinstance(processor, DictConfig):
                 processor = instantiate(processor)
+            # Override num_obs_steps to account for history raw frames,
+            # since BaseLerobotDataset loads total_num_frames frames
+            # (num_frames + num_history_raw_frames).
+            processor.num_obs_steps = total_num_frames
             if not pretrained_norm_stats:
                 if not is_training_set:
                     raise ValueError("pretrained_norm_stats must be provided for validation/test sets since we don't want to calculate stats on them.")
@@ -143,6 +149,45 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             sample_idx = np.random.randint(len(self.lerobot_dataset))
         
         image_is_pad = sample["image_is_pad"]
+
+        # --- Boundary frame replication ---
+        # When past_obs_size > 0 and the sample is near an episode boundary,
+        # some frames are zero-padded by LeRobot. Replace them with the nearest
+        # valid frame (replicate frame-0 for the beginning, last frame for the end)
+        # so that condition/history frames are visually plausible static frames.
+        if self.num_history_raw_frames > 0 and image_is_pad.any():
+            pv = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
+            non_pad_indices = (~image_is_pad).nonzero(as_tuple=True)[0]
+            if len(non_pad_indices) > 0:
+                first_valid = non_pad_indices[0].item()
+                last_valid = non_pad_indices[-1].item()
+                pv = pv.clone()
+
+                # Replicate beginning: padded frames before first_valid get first_valid's pixels
+                if first_valid > 0:
+                    if pv.ndim == 5:
+                        pv[:, :first_valid] = pv[:, first_valid:first_valid + 1]
+                    else:
+                        pv[:first_valid] = pv[first_valid:first_valid + 1]
+
+                # Replicate end: padded frames after last_valid get last_valid's pixels
+                if last_valid < image_is_pad.shape[0] - 1:
+                    if pv.ndim == 5:
+                        pv[:, last_valid + 1:] = pv[:, last_valid:last_valid + 1]
+                    else:
+                        pv[last_valid + 1:] = pv[last_valid:last_valid + 1]
+
+                sample["pixel_values"] = pv
+
+                # Also replicate state/proprio at padded boundary positions
+                for state_key in ("proprio", "state"):
+                    if state_key in sample and isinstance(sample[state_key], torch.Tensor):
+                        s = sample[state_key].clone()
+                        if first_valid > 0:
+                            s[:first_valid] = s[first_valid:first_valid + 1]
+                        if last_valid < image_is_pad.shape[0] - 1:
+                            s[last_valid + 1:] = s[last_valid:last_valid + 1]
+                        sample[state_key] = s
 
         video = sample["pixel_values"]  # [T, C, H, W] or [num_cameras, T, C, H, W]
         num_cameras = 1
@@ -211,8 +256,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         if self.num_history_raw_frames > 0:
             action = action[self.num_history_raw_frames:, :]            # [32, action_dim]
             proprio = proprio[self.num_history_raw_frames:, :]          # [32, state_dim]
-            action_is_pad = sample["action_is_pad"][self.num_history_raw_frames:, :]
-            proprio_is_pad = sample["proprio_is_pad"][self.num_history_raw_frames:, :]
+            action_is_pad = sample["action_is_pad"][self.num_history_raw_frames:]
+            proprio_is_pad = sample["proprio_is_pad"][self.num_history_raw_frames:]
         else:
             action_is_pad = sample["action_is_pad"]
             proprio_is_pad = sample["proprio_is_pad"]

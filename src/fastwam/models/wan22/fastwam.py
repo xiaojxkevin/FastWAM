@@ -470,11 +470,15 @@ class FastWAM(torch.nn.Module):
         else:
             video_is_pad = latent_tail_is_pad
 
-        if video_is_pad.shape[1] != video_loss_token.shape[1]:
+        # When condition latent frames are stripped from pred_video (pred_video[:, :, K:]),
+        # video_is_pad contains extra leading steps. Trim from the front to align.
+        n_skip = video_is_pad.shape[1] - video_loss_token.shape[1]
+        if n_skip < 0:
             raise ValueError(
                 "Video-loss mask shape mismatch: "
                 f"mask steps={video_is_pad.shape[1]}, loss steps={video_loss_token.shape[1]}."
             )
+        video_is_pad = video_is_pad[:, n_skip:]
 
         valid = (~video_is_pad).to(device=video_loss_token.device, dtype=video_loss_token.dtype)
         valid_sum = valid.sum(dim=1).clamp(min=1.0)
@@ -982,11 +986,24 @@ class FastWAM(torch.nn.Module):
 
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+        if input_image.ndim == 4:
+            # Single-frame: [1, 3, H, W]
+            if input_image.shape[0] != 1 or input_image.shape[1] != 3:
+                raise ValueError(
+                    f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                )
+            _, _, height, width = input_image.shape
+        elif input_image.ndim == 5:
+            # Multi-frame: [1, 3, N, H, W]
+            if input_image.shape[0] != 1 or input_image.shape[1] != 3:
+                raise ValueError(
+                    f"Multi-frame `input_image` must have shape [1,3,N,H,W], got {tuple(input_image.shape)}"
+                )
+            _, _, _, height, width = input_image.shape
+        else:
             raise ValueError(
-                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                f"`input_image` must have shape [1,3,H,W], [1,3,N,H,W], or [3,H,W], got {tuple(input_image.shape)}"
             )
-        _, _, height, width = input_image.shape
         if height % 16 != 0 or width % 16 != 0:
             raise ValueError(
                 f"`input_image` must be resized before infer, expected multiples of 16 but got HxW=({height},{width})"

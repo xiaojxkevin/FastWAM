@@ -114,11 +114,24 @@ class FastWAMJoint(FastWAM):
 
         if input_image.ndim == 3:
             input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
+        if input_image.ndim == 4:
+            # Single-frame: [1, 3, H, W]
+            if input_image.shape[0] != 1 or input_image.shape[1] != 3:
+                raise ValueError(
+                    f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                )
+            _, _, height, width = input_image.shape
+        elif input_image.ndim == 5:
+            # Multi-frame: [1, 3, N, H, W]
+            if input_image.shape[0] != 1 or input_image.shape[1] != 3:
+                raise ValueError(
+                    f"Multi-frame `input_image` must have shape [1,3,N,H,W], got {tuple(input_image.shape)}"
+                )
+            _, _, _, height, width = input_image.shape
+        else:
             raise ValueError(
-                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
+                f"`input_image` must have shape [1,3,H,W], [1,3,N,H,W], or [3,H,W], got {tuple(input_image.shape)}"
             )
-        _, _, height, width = input_image.shape
         checked_h, checked_w, checked_t = self._check_resize_height_width(height, width, num_video_frames)
         if (checked_h, checked_w) != (height, width):
             raise ValueError(
