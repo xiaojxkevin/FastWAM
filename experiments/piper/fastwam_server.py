@@ -33,7 +33,9 @@ import asyncio
 import hashlib
 import http
 import logging
+import queue
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -52,13 +54,62 @@ import websockets.frames
 
 from .msgpack_numpy import packb, unpackb
 
-from fastwam.runtime import create_fastwam
+from fastwam.runtime import create_fastwam, create_fastwam_idm
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.transforms.action_state_merger import ConcatLeftAlign
+from fastwam.utils.video_io import save_mp4
+from fastwam.utils.fs import ensure_dir
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Video saver (background thread)
+# ---------------------------------------------------------------------------
+
+class VideoSaverWorker:
+    """Background thread that saves PIL frame sequences to MP4 files via a queue.
+
+    The queue decouples GPU inference latency from disk I/O — ``save_mp4``
+    uses ``imageio`` / ffmpeg underneath which is a blocking subprocess call.
+    """
+
+    def __init__(self, output_dir: Path, fps: int = 15):
+        self._queue: queue.Queue = queue.Queue()
+        self._output_dir = output_dir
+        self._fps = fps
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        ensure_dir(self._output_dir)
+        self._thread = threading.Thread(target=self._run, daemon=True, name="video-saver")
+        self._thread.start()
+        logger.info("VideoSaverWorker started (output_dir=%s, fps=%d)", self._output_dir, self._fps)
+
+    def stop(self, timeout: float = 30.0) -> None:
+        self._queue.put(None)  # sentinel
+        if self._thread is not None:
+            self._thread.join(timeout=timeout)
+            if self._thread.is_alive():
+                logger.warning("VideoSaverWorker did not stop within %s seconds", timeout)
+
+    def enqueue(self, frames: list, filename: str) -> None:
+        self._queue.put((frames, filename))
+
+    def _run(self) -> None:
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            frames, filename = item
+            out_path = str(self._output_dir / filename)
+            try:
+                save_mp4(frames, out_path, fps=self._fps)
+                logger.info("Saved video: %s", out_path)
+            except Exception:
+                logger.exception("Failed to save video: %s", out_path)
 
 
 # ---------------------------------------------------------------------------
@@ -83,9 +134,14 @@ class FastWAMModelWrapper:
         self._model_dtype = _dtype_map[dtype_str]
         self._device = str(cfg.get("device", "cuda"))
 
-        # --- build model -----------------------------------------------------
-        logger.info("Creating FastWAM model …")
-        self._model = create_fastwam(
+        # --- mode -----------------------------------------------------------
+        mode = str(cfg.get("mode", "uncond"))
+        if mode not in ("uncond", "joint", "idm"):
+            raise ValueError(f"Unknown mode: {mode!r}. Must be one of: uncond, joint, idm")
+        self._mode = mode
+
+        # --- build model (mode-dependent factory) ---------------------------
+        _factory_kwargs = dict(
             model_id=str(model_cfg["model_id"]),
             tokenizer_model_id=str(model_cfg["tokenizer_model_id"]),
             tokenizer_max_len=int(model_cfg.get("tokenizer_max_len", 128)),
@@ -102,6 +158,12 @@ class FastWAMModelWrapper:
             model_dtype=self._model_dtype,
             device=self._device,
         )
+        if self._mode == "idm":
+            logger.info("Creating FastWAM model (IDM mode) …")
+            self._model = create_fastwam_idm(**_factory_kwargs)
+        else:
+            logger.info("Creating FastWAM model (mode=%s) …", self._mode)
+            self._model = create_fastwam(**_factory_kwargs)
 
         # --- load finetuned checkpoint ---------------------------------------
         ckpt_path = Path(cfg["checkpoint_path"])
@@ -162,12 +224,25 @@ class FastWAMModelWrapper:
 
         # --- inference params ------------------------------------------------
         self._action_horizon = int(inf_cfg.get("action_horizon", 32))
+        self._num_video_frames = int(inf_cfg.get("num_video_frames", self._action_horizon + 1))
         self._num_inference_steps = int(inf_cfg.get("num_inference_steps", 20))
         self._seed = inf_cfg.get("seed")  # None or int
 
+        # --- video saver (joint / idm modes only) ---------------------------
+        self._video_saver: Optional[VideoSaverWorker] = None
+        self._video_output_dir: Optional[Path] = None
+        if self._mode in ("joint", "idm"):
+            video_out_str = str(cfg.get("video_output_dir", "./outputs/videos"))
+            self._video_output_dir = Path(video_out_str)
+            if not self._video_output_dir.is_absolute():
+                self._video_output_dir = _PROJECT_ROOT / self._video_output_dir
+            video_fps = int(cfg.get("video_fps", 15))
+            self._video_saver = VideoSaverWorker(self._video_output_dir, fps=video_fps)
+            self._video_saver.start()
+
         logger.info(
-            "FastWAM server ready | device=%s dtype=%s action_horizon=%d",
-            self._device, dtype_str, self._action_horizon,
+            "FastWAM server ready | device=%s dtype=%s mode=%s action_horizon=%d",
+            self._device, dtype_str, self._mode, self._action_horizon,
         )
 
     # -------------------------------------------------------------------
@@ -227,6 +302,15 @@ class FastWAMModelWrapper:
         normalizer = self._processor.normalizer.normalizers["action"][action_key]
         denorm = normalizer.backward(action.to(dtype=torch.float32, device="cpu"))
         return denorm.numpy()
+
+    # -------------------------------------------------------------------
+    # Lifecycle
+    # -------------------------------------------------------------------
+
+    def shutdown(self) -> None:
+        """Gracefully stop the video saver thread if running."""
+        if self._video_saver is not None:
+            self._video_saver.stop()
 
     # -------------------------------------------------------------------
     # Text context (cache or online encoder)
@@ -289,43 +373,130 @@ class FastWAMModelWrapper:
     # Inference
     # -------------------------------------------------------------------
 
-    def infer(self, observation: dict[str, Any]) -> dict[str, Any]:
+    def infer(self, observation: dict[str, Any], index: int = 0) -> dict[str, Any]:
         """Run a single synchronous inference step.
 
         Parameters
         ----------
         observation : dict
-            ``{"state": ndarray[14], "images": {"fixed_front": ..., "left_arm": ..., "right_arm": ...}, "prompt": str}``
+            ``{"state": ndarray[14], "images": {...}, "prompt": str}``
+        index : int
+            Per-connection step counter; server generates and returns this.
 
         Returns
         -------
         dict
-            ``{"actions": ndarray[T, 14]}`` — denormalised action chunk.
+            ``{"index": int, "actions": ndarray[T,14], "server_timing": {...}}``.
         """
+
         image_tensor = self._preprocess_images(observation["images"])
         proprio = self._normalize_state(observation["state"])
         prompt = DEFAULT_PROMPT.format(task=observation.get("prompt", "take the cloth from the basket and fold the cloth."))
 
         infer_prompt, context, context_mask = self._get_text_context(prompt)
 
-        seed = self._seed
+        if self._mode == "uncond":
+            return self._infer_uncond(image_tensor, proprio, infer_prompt,
+                                      context, context_mask, index)
+        elif self._mode == "joint":
+            return self._infer_joint(image_tensor, proprio, infer_prompt,
+                                     context, context_mask, index)
+        elif self._mode == "idm":
+            return self._infer_idm(image_tensor, proprio, infer_prompt,
+                                   context, context_mask, index)
+        else:
+            raise RuntimeError(f"Unsupported mode: {self._mode!r}")
+
+    def _infer_uncond(
+        self, image_tensor: torch.Tensor, proprio: torch.Tensor,
+        prompt: Optional[str], context: Optional[torch.Tensor],
+        context_mask: Optional[torch.Tensor], index: int,
+    ) -> dict[str, Any]:
+        """Action-only inference via ``infer_action``."""
         infer_t0 = time.perf_counter()
         with torch.no_grad():
             pred = self._model.infer_action(
-                prompt=infer_prompt,
+                prompt=prompt,
                 context=context,
                 context_mask=context_mask,
                 input_image=image_tensor,
                 action_horizon=self._action_horizon,
                 proprio=proprio,
                 num_inference_steps=self._num_inference_steps,
-                seed=seed,
+                seed=self._seed,
             )
         infer_ms = (time.perf_counter() - infer_t0) * 1000.0
-
-        actions = self._denormalize_action(pred["action"])[0]  # [T, 14]
+        actions = self._denormalize_action(pred["action"])[0]
         return {
+            "index": index,
             "actions": actions.astype(np.float32),
+            "server_timing": {"infer_ms": round(infer_ms, 3)},
+        }
+
+    def _infer_joint(
+        self, image_tensor: torch.Tensor, proprio: torch.Tensor,
+        prompt: Optional[str], context: Optional[torch.Tensor],
+        context_mask: Optional[torch.Tensor], index: int,
+    ) -> dict[str, Any]:
+        """Joint video+action inference; video saved locally by background thread."""
+        infer_t0 = time.perf_counter()
+        with torch.no_grad():
+            pred = self._model.infer_joint(
+                prompt=prompt,
+                context=context,
+                context_mask=context_mask,
+                input_image=image_tensor,
+                num_video_frames=self._num_video_frames,
+                action_horizon=self._action_horizon,
+                proprio=proprio,
+                num_inference_steps=self._num_inference_steps,
+                seed=self._seed,
+                test_action_with_infer_action=False,
+            )
+        infer_ms = (time.perf_counter() - infer_t0) * 1000.0
+        actions = self._denormalize_action(pred["action"])[0]
+
+        video_filename = f"index_{index:06d}.mp4"
+        self._video_saver.enqueue(pred["video"], video_filename)  # type: ignore[union-attr]
+        video_path = str(self._video_output_dir / video_filename)  # type: ignore[operator]
+
+        return {
+            "index": index,
+            "actions": actions.astype(np.float32),
+            "video_path": video_path,
+            "server_timing": {"infer_ms": round(infer_ms, 3)},
+        }
+
+    def _infer_idm(
+        self, image_tensor: torch.Tensor, proprio: torch.Tensor,
+        prompt: Optional[str], context: Optional[torch.Tensor],
+        context_mask: Optional[torch.Tensor], index: int,
+    ) -> dict[str, Any]:
+        """IDM two-stage inference; video saved locally by background thread."""
+        infer_t0 = time.perf_counter()
+        with torch.no_grad():
+            pred = self._model.infer_joint(
+                prompt=prompt,
+                context=context,
+                context_mask=context_mask,
+                input_image=image_tensor,
+                num_video_frames=self._num_video_frames,
+                action_horizon=self._action_horizon,
+                proprio=proprio,
+                num_inference_steps=self._num_inference_steps,
+                seed=self._seed,
+            )
+        infer_ms = (time.perf_counter() - infer_t0) * 1000.0
+        actions = self._denormalize_action(pred["action"])[0]
+
+        video_filename = f"index_{index:06d}.mp4"
+        self._video_saver.enqueue(pred["video"], video_filename)  # type: ignore[union-attr]
+        video_path = str(self._video_output_dir / video_filename)  # type: ignore[operator]
+
+        return {
+            "index": index,
+            "actions": actions.astype(np.float32),
+            "video_path": video_path,
             "server_timing": {"infer_ms": round(infer_ms, 3)},
         }
 
@@ -370,6 +541,7 @@ class FastWAMPolicyServer:
 
     async def _handler(self, websocket: _server.ServerConnection) -> None:
         logger.info("Connection from %s opened", websocket.remote_address)
+        step_index = 0
 
         # Frame 0: send metadata
         await websocket.send(packb(self._metadata))
@@ -379,7 +551,8 @@ class FastWAMPolicyServer:
                 t0 = time.monotonic()
                 obs = unpackb(await websocket.recv())
 
-                result = self._wrapper.infer(obs)
+                result = self._wrapper.infer(obs, step_index)
+                step_index += 1
 
                 total_ms = (time.monotonic() - t0) * 1000.0
                 result.setdefault("server_timing", {})["total_ms"] = round(total_ms, 3)
@@ -387,7 +560,7 @@ class FastWAMPolicyServer:
                 await websocket.send(packb(result))
 
             except websockets.ConnectionClosed:
-                logger.info("Connection from %s closed", websocket.remote_address)
+                logger.info("Connection from %s closed (steps=%d)", websocket.remote_address, step_index)
                 break
             except Exception:
                 await websocket.send(traceback.format_exc())

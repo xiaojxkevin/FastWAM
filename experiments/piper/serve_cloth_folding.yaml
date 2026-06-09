@@ -10,10 +10,17 @@
 
 # ---- Server settings -------------------------------------------------
 host: "0.0.0.0"
-port: 8765
+port: 6006 # 10.15.89.71:16873
+
+# ---- Mode switch -----------------------------------------------------
+mode: "joint" # uncond | joint | idm
+
+# ---- Video output (for joint / idm modes) ----------------------------
+video_output_dir: "./outputs/videos"
+video_fps: 30
 
 # ---- Checkpoint -----------------------------------------------------
-checkpoint_path: "/workspace/mnt/sealab/xiaojx/FastWAM/runs/cloth_folding_3cam_384_1e-4/run_job_2026-06-03-02/checkpoints/weights/step_017500.pt"
+checkpoint_path: "/data/sea_disk0/xiaojx/policy_proj/FastWAM/pretrained/step_017500.pt"
 model_dtype: "bf16" # bf16 | fp16 | no
 device: "cuda"
 
@@ -82,7 +89,7 @@ model:
 
 # ---- Data processing (mirrors configs/data/cloth_folding.yaml) ------
 data:
-  dataset_stats_path: "/workspace/mnt/sealab/xiaojx/FastWAM/runs/cloth_folding_3cam_384_1e-4/run_job_2026-06-03-02/dataset_stats.json"
+  dataset_stats_path: "/data/sea_disk0/xiaojx/policy_proj/FastWAM/pretrained/dataset_stats.json"
   shape_meta:
     images:
       - key: fixed_front
@@ -113,5 +120,6 @@ data:
 # ---- Inference hyperparameters --------------------------------------
 inference:
   action_horizon: 32 # num_frames - 1 = 32
+  num_video_frames: 33 # for joint/idm; must satisfy T % 4 == 1
   num_inference_steps: 10 # diffusion denoising steps
   seed: null # null = random each request

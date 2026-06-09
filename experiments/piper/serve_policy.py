@@ -57,12 +57,16 @@ def main() -> None:
     host = str(cfg.get("host", "0.0.0.0"))
     port = int(cfg.get("port", 8765))
 
+    mode = str(cfg.get("mode", "uncond"))
     metadata = {
         "action_dim": cfg["data"]["action_output_dim"],
         "action_horizon": cfg["inference"]["action_horizon"],
+        "mode": mode,
+        "num_video_frames": int(cfg["inference"].get("num_video_frames",
+                                      cfg["inference"]["action_horizon"] + 1)),
     }
 
-    logger.info("Initialising FastWAM model wrapper …")
+    logger.info("Initialising FastWAM model wrapper (mode=%s) …", mode)
     wrapper = FastWAMModelWrapper(cfg)
 
     server = FastWAMPolicyServer(
@@ -71,7 +75,10 @@ def main() -> None:
         port=port,
         metadata=metadata,
     )
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        wrapper.shutdown()
 
 
 if __name__ == "__main__":
