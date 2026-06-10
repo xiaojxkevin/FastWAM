@@ -380,6 +380,10 @@ class FastWAMModelWrapper:
         ----------
         observation : dict
             ``{"state": ndarray[14], "images": {...}, "prompt": str}``
+            Optional RTC fields:
+            ``prev_action_chunk``, ``inference_delay``, ``execute_horizon``,
+            ``num_steps``, ``mask_prefix_delay``, ``prefix_attention_schedule``,
+            ``max_guidance_weight``, ``enable_rtc``.
         index : int
             Per-connection step counter; server generates and returns this.
 
@@ -395,15 +399,38 @@ class FastWAMModelWrapper:
 
         infer_prompt, context, context_mask = self._get_text_context(prompt)
 
+        # --- extract RTC fields (all optional) -------------------------------
+        rtc_kwargs = {
+            "inference_delay": int(observation.get("inference_delay", 0)),
+            "execute_horizon": observation.get("execute_horizon"),
+            "mask_prefix_delay": bool(observation.get("mask_prefix_delay", True)),
+            "prefix_attention_schedule": str(observation.get("prefix_attention_schedule", "linear")),
+            "max_guidance_weight": float(observation.get("max_guidance_weight", 1.0)),
+            "enable_rtc": bool(observation.get("enable_rtc", False)),
+        }
+        # convert prev_action_chunk from numpy to torch if present
+        raw_prev = observation.get("prev_action_chunk")
+        if raw_prev is not None:
+            rtc_kwargs["prev_action_chunk"] = torch.from_numpy(
+                np.asarray(raw_prev, dtype=np.float32)
+            ).unsqueeze(0)  # [1, T, D]
+        else:
+            rtc_kwargs["prev_action_chunk"] = None
+
+        # num_steps override
+        num_steps_override = observation.get("num_steps")
+        if num_steps_override is not None:
+            rtc_kwargs["num_inference_steps"] = int(num_steps_override)
+
         if self._mode == "uncond":
             return self._infer_uncond(image_tensor, proprio, infer_prompt,
-                                      context, context_mask, index)
+                                      context, context_mask, index, rtc_kwargs)
         elif self._mode == "joint":
             return self._infer_joint(image_tensor, proprio, infer_prompt,
                                      context, context_mask, index)
         elif self._mode == "idm":
             return self._infer_idm(image_tensor, proprio, infer_prompt,
-                                   context, context_mask, index)
+                                   context, context_mask, index, rtc_kwargs)
         else:
             raise RuntimeError(f"Unsupported mode: {self._mode!r}")
 
@@ -411,27 +438,60 @@ class FastWAMModelWrapper:
         self, image_tensor: torch.Tensor, proprio: torch.Tensor,
         prompt: Optional[str], context: Optional[torch.Tensor],
         context_mask: Optional[torch.Tensor], index: int,
+        rtc_kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Action-only inference via ``infer_action``."""
+        """Action-only inference via ``infer_action`` or ``infer_action_with_rtc``."""
+        rtc = rtc_kwargs or {}
+        use_rtc = (
+            rtc.get("enable_rtc", False)
+            and rtc.get("prev_action_chunk") is not None
+        )
+
         infer_t0 = time.perf_counter()
-        with torch.no_grad():
-            pred = self._model.infer_action(
-                prompt=prompt,
-                context=context,
-                context_mask=context_mask,
-                input_image=image_tensor,
-                action_horizon=self._action_horizon,
-                proprio=proprio,
-                num_inference_steps=self._num_inference_steps,
-                seed=self._seed,
-            )
+        if use_rtc:
+            num_steps = rtc.get("num_inference_steps", self._num_inference_steps)
+            with torch.no_grad():
+                # no_grad is safe here — RTC guidance uses its own grad context
+                # inside _rtc_action_step via requires_grad_ on the action input.
+                pred = self._model.infer_action_with_rtc(
+                    prompt=prompt,
+                    context=context,
+                    context_mask=context_mask,
+                    input_image=image_tensor,
+                    action_horizon=self._action_horizon,
+                    proprio=proprio,
+                    num_inference_steps=num_steps,
+                    seed=self._seed,
+                    prev_action_chunk=rtc["prev_action_chunk"],
+                    inference_delay=rtc["inference_delay"],
+                    execute_horizon=rtc["execute_horizon"],
+                    mask_prefix_delay=rtc["mask_prefix_delay"],
+                    prefix_attention_schedule=rtc["prefix_attention_schedule"],
+                    max_guidance_weight=rtc["max_guidance_weight"],
+                    enable_rtc=True,
+                )
+        else:
+            with torch.no_grad():
+                pred = self._model.infer_action(
+                    prompt=prompt,
+                    context=context,
+                    context_mask=context_mask,
+                    input_image=image_tensor,
+                    action_horizon=self._action_horizon,
+                    proprio=proprio,
+                    num_inference_steps=self._num_inference_steps,
+                    seed=self._seed,
+                )
         infer_ms = (time.perf_counter() - infer_t0) * 1000.0
         actions = self._denormalize_action(pred["action"])[0]
-        return {
+        result: dict[str, Any] = {
             "index": index,
             "actions": actions.astype(np.float32),
             "server_timing": {"infer_ms": round(infer_ms, 3)},
         }
+        if use_rtc:
+            result["rtc_applied"] = True
+        return result
 
     def _infer_joint(
         self, image_tensor: torch.Tensor, proprio: torch.Tensor,
@@ -471,8 +531,23 @@ class FastWAMModelWrapper:
         self, image_tensor: torch.Tensor, proprio: torch.Tensor,
         prompt: Optional[str], context: Optional[torch.Tensor],
         context_mask: Optional[torch.Tensor], index: int,
+        rtc_kwargs: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """IDM two-stage inference; video saved locally by background thread."""
+        """IDM two-stage inference; video saved locally by background thread.
+
+        .. note::
+
+            RTC prefix guidance for IDM stage 2 is not yet implemented.
+            RTC fields are accepted but silently ignored — the standard
+            two-stage pipeline is used regardless.
+        """
+        rtc = rtc_kwargs or {}
+        if rtc.get("enable_rtc") and rtc.get("prev_action_chunk") is not None:
+            logger.warning(
+                "RTC prefix guidance is not yet implemented for IDM mode. "
+                "Falling back to standard two-stage inference."
+            )
+        num_steps = rtc.get("num_inference_steps", self._num_inference_steps)
         infer_t0 = time.perf_counter()
         with torch.no_grad():
             pred = self._model.infer_joint(
@@ -483,7 +558,7 @@ class FastWAMModelWrapper:
                 num_video_frames=self._num_video_frames,
                 action_horizon=self._action_horizon,
                 proprio=proprio,
-                num_inference_steps=self._num_inference_steps,
+                num_inference_steps=num_steps,
                 seed=self._seed,
             )
         infer_ms = (time.perf_counter() - infer_t0) * 1000.0

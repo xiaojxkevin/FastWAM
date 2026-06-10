@@ -64,6 +64,10 @@ def main() -> None:
         "mode": mode,
         "num_video_frames": int(cfg["inference"].get("num_video_frames",
                                       cfg["inference"]["action_horizon"] + 1)),
+        # RTC prefix guidance is supported in uncond mode (KV-cache action-only
+        # denoising) and idm mode (stage 2).  Joint mode does full video+action
+        # denoising per step and would be ~3–5× slower with RTC.
+        "rtc_supported": mode in ("uncond", "idm"),
     }
 
     logger.info("Initialising FastWAM model wrapper (mode=%s) …", mode)
