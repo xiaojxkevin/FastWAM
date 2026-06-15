@@ -10,7 +10,6 @@ from fastwam.utils.logging_config import get_logger
 from .action_dit import ActionDiT
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
-from .rtc_guidance import compute_rtc_guidance_weight, get_prefix_weights
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
 
 logger = get_logger(__name__)
@@ -39,6 +38,9 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        training_rtc_enabled: bool = False,
+        training_rtc_max_delay: int = 10,
+        training_rtc_delay_distribution: str = "uniform",
     ):
         super().__init__()
         self.video_expert = video_expert
@@ -85,6 +87,18 @@ class FastWAM(torch.nn.Module):
         self.torch_dtype = torch_dtype
         self.loss_lambda_video = float(loss_lambda_video)
         self.loss_lambda_action = float(loss_lambda_action)
+        self.training_rtc_enabled = bool(training_rtc_enabled)
+        self.training_rtc_max_delay = int(training_rtc_max_delay)
+        self.training_rtc_delay_distribution = str(training_rtc_delay_distribution)
+        if self.training_rtc_max_delay < 0:
+            raise ValueError(
+                f"`training_rtc_max_delay` must be non-negative, got {self.training_rtc_max_delay}."
+            )
+        if self.training_rtc_delay_distribution != "uniform":
+            raise ValueError(
+                "Only `training_rtc_delay_distribution='uniform'` is currently supported, "
+                f"got {self.training_rtc_delay_distribution!r}."
+            )
 
         self.to(self.device)
 
@@ -112,6 +126,9 @@ class FastWAM(torch.nn.Module):
         action_num_train_timesteps: int = 1000,
         loss_lambda_video: float = 1.0,
         loss_lambda_action: float = 1.0,
+        training_rtc_enabled: bool = False,
+        training_rtc_max_delay: int = 10,
+        training_rtc_delay_distribution: str = "uniform",
     ):
         if video_dit_config is None:
             raise ValueError("`video_dit_config` is required for FastWAM.from_wan22_pretrained().")
@@ -169,6 +186,9 @@ class FastWAM(torch.nn.Module):
             action_num_train_timesteps=action_num_train_timesteps,
             loss_lambda_video=loss_lambda_video,
             loss_lambda_action=loss_lambda_action,
+            training_rtc_enabled=training_rtc_enabled,
+            training_rtc_max_delay=training_rtc_max_delay,
+            training_rtc_delay_distribution=training_rtc_delay_distribution,
         )
         model.model_paths = {
             "video_dit": components.dit_path,
@@ -407,6 +427,66 @@ class FastWAM(torch.nn.Module):
         mask[video_seq_len:, :first_frame_tokens] = True
         return mask
 
+    def _sample_training_rtc_delays(
+        self,
+        batch_size: int,
+        action_horizon: int,
+        action_is_pad: Optional[torch.Tensor],
+        device: torch.device,
+    ) -> torch.Tensor:
+        if action_horizon <= 1 or self.training_rtc_max_delay <= 0:
+            return torch.zeros((0,), dtype=torch.long, device=device)
+
+        if batch_size <= 0:
+            return torch.zeros((0,), dtype=torch.long, device=device)
+        if action_is_pad is not None and action_is_pad.shape[0] != batch_size:
+            raise ValueError(
+                f"`action_is_pad` batch size mismatch: got {action_is_pad.shape[0]} vs {batch_size}."
+            )
+
+        max_delay = min(self.training_rtc_max_delay, action_horizon - 1)
+        delays = torch.randint(
+            low=0,
+            high=max_delay + 1,
+            size=(batch_size,),
+            device=device,
+            dtype=torch.long,
+        )
+        if action_is_pad is not None:
+            valid_len = (~action_is_pad).to(device=device).long().sum(dim=1)
+            max_valid_delay = (valid_len - 1).clamp(min=0, max=max_delay)
+            delays = torch.minimum(delays, max_valid_delay)
+        return delays
+
+    def _build_training_rtc_action_inputs(
+        self,
+        action: torch.Tensor,
+        noisy_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        action_is_pad: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, action_horizon, _ = action.shape
+        if not self.training_rtc_enabled:
+            loss_mask = torch.ones((batch_size, action_horizon), dtype=torch.bool, device=action.device)
+            return noisy_action, timestep_action, loss_mask, torch.zeros(
+                (batch_size,), dtype=torch.long, device=action.device
+            )
+
+        delays = self._sample_training_rtc_delays(
+            batch_size=batch_size,
+            action_horizon=action_horizon,
+            action_is_pad=action_is_pad,
+            device=action.device,
+        )
+        if delays.numel() == 0:
+            delays = torch.zeros((batch_size,), dtype=torch.long, device=action.device)
+        prefix_mask = torch.arange(action_horizon, device=action.device).unsqueeze(0) < delays.unsqueeze(1)
+        action_tokens = torch.where(prefix_mask.unsqueeze(-1), action, noisy_action)
+        timestep_tokens = timestep_action.unsqueeze(1).expand(-1, action_horizon).clone()
+        timestep_tokens = torch.where(prefix_mask, torch.zeros_like(timestep_tokens), timestep_tokens)
+        loss_mask = ~prefix_mask
+        return action_tokens, timestep_tokens, loss_mask, delays
+
     def _compute_video_loss_per_sample(
         self,
         pred_video: torch.Tensor,
@@ -476,6 +556,14 @@ class FastWAM(torch.nn.Module):
         )
         noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
         target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+        action_model_input, action_model_timestep, action_loss_mask, rtc_delays = (
+            self._build_training_rtc_action_inputs(
+                action=action,
+                noisy_action=noisy_action,
+                timestep_action=timestep_action,
+                action_is_pad=action_is_pad,
+            )
+        )
 
         video_pre = self.video_expert.pre_dit(
             x=latents,
@@ -487,8 +575,8 @@ class FastWAM(torch.nn.Module):
         )
 
         action_pre = self.action_expert.pre_dit(
-            action_tokens=noisy_action,
-            timestep=timestep_action,
+            action_tokens=action_model_input,
+            timestep=action_model_timestep,
             context=context,
             context_mask=context_mask,
         )
@@ -549,12 +637,12 @@ class FastWAM(torch.nn.Module):
         loss_video = (loss_video_per_sample * video_weight).mean()
 
         action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2) # [B, T]
+        valid_bool = action_loss_mask.to(device=action_loss_token.device)
         if action_is_pad is not None:
-            valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
-            valid_sum = valid.sum(dim=1).clamp(min=1.0)
-            action_loss_per_sample = (action_loss_token * valid).sum(dim=1) / valid_sum
-        else:
-            action_loss_per_sample = action_loss_token.mean(dim=1)
+            valid_bool = valid_bool & (~action_is_pad.to(device=action_loss_token.device))
+        valid = valid_bool.to(dtype=action_loss_token.dtype)
+        valid_sum = valid.sum(dim=1).clamp(min=1.0)
+        action_loss_per_sample = (action_loss_token * valid).sum(dim=1) / valid_sum
 
         action_weight = self.train_action_scheduler.training_weight(timestep_action).to(
             action_loss_per_sample.device, dtype=action_loss_per_sample.dtype
@@ -566,6 +654,9 @@ class FastWAM(torch.nn.Module):
             "loss_video": self.loss_lambda_video * float(loss_video.detach().item()),
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
         }
+        if self.training_rtc_enabled:
+            loss_dict["rtc_delay_mean"] = float(rtc_delays.detach().float().mean().item())
+            loss_dict["rtc_prefix_frac"] = float((~action_loss_mask).detach().float().mean().item())
         return loss_total, loss_dict
 
     @torch.no_grad()
@@ -703,47 +794,6 @@ class FastWAM(torch.nn.Module):
         attention_mask: torch.Tensor,
         video_seq_len: int,
     ) -> torch.Tensor:
-        action_pre = self.action_expert.pre_dit(
-            action_tokens=latents_action,
-            timestep=timestep_action,
-            context=context,
-            context_mask=context_mask,
-        )
-        action_tokens = self.mot.forward_action_with_video_cache(
-            action_tokens=action_pre["tokens"],
-            action_freqs=action_pre["freqs"],
-            action_t_mod=action_pre["t_mod"],
-            action_context_payload={
-                "context": action_pre["context"],
-                "mask": action_pre["context_mask"],
-            },
-            video_kv_cache=video_kv_cache,
-            attention_mask=attention_mask,
-            video_seq_len=video_seq_len,
-        )
-        return self.action_expert.post_dit(action_tokens, action_pre)
-
-    # ------------------------------------------------------------------
-    # Gradient-enabled denoiser (for RTC VJP computation)
-    # ------------------------------------------------------------------
-
-    def _predict_action_noise_with_cache_grad(
-        self,
-        latents_action: torch.Tensor,
-        timestep_action: torch.Tensor,
-        context: torch.Tensor,
-        context_mask: torch.Tensor,
-        video_kv_cache: list[dict[str, torch.Tensor]],
-        attention_mask: torch.Tensor,
-        video_seq_len: int,
-    ) -> torch.Tensor:
-        """Gradient-enabled variant of ``_predict_action_noise_with_cache``.
-
-        Identical forward pass but **without** ``@torch.no_grad()``, so
-        ``torch.autograd.grad`` can compute VJPs through the action branch.
-        Only used inside RTC guidance steps where gradients are required for
-        the prefix correction.
-        """
         action_pre = self.action_expert.pre_dit(
             action_tokens=latents_action,
             timestep=timestep_action,
@@ -960,6 +1010,9 @@ class FastWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
+        action_prefix: Optional[torch.Tensor] = None,
+        prefix_delay: int = 0,
+        action_denoise_runner: Optional[Any] = None,
     ) -> dict[str, Any]:
         self.eval()
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
@@ -1063,152 +1116,87 @@ class FastWAM(torch.nn.Module):
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
         )
 
+        prefix_tokens = None
+        prefix_mask = None
+        d = max(0, min(int(prefix_delay), action_horizon))
+        if action_prefix is not None and d > 0:
+            prefix_tokens = action_prefix.to(device=self.device, dtype=latents_action.dtype)
+            if prefix_tokens.ndim == 2:
+                prefix_tokens = prefix_tokens.unsqueeze(0)
+            if prefix_tokens.ndim != 3 or prefix_tokens.shape[0] != 1:
+                raise ValueError(
+                    f"`action_prefix` must have shape [T,D] or [1,T,D], got {tuple(prefix_tokens.shape)}"
+                )
+            if prefix_tokens.shape[1] < d:
+                raise ValueError(
+                    f"`action_prefix` length {prefix_tokens.shape[1]} is shorter than prefix_delay={d}."
+                )
+            if prefix_tokens.shape[2] > self.action_expert.action_dim:
+                prefix_tokens = prefix_tokens[:, :, : self.action_expert.action_dim]
+            elif prefix_tokens.shape[2] < self.action_expert.action_dim:
+                pad = torch.zeros(
+                    (1, prefix_tokens.shape[1], self.action_expert.action_dim - prefix_tokens.shape[2]),
+                    device=prefix_tokens.device,
+                    dtype=prefix_tokens.dtype,
+                )
+                prefix_tokens = torch.cat([prefix_tokens, pad], dim=2)
+            prefix_tokens = torch.nan_to_num(prefix_tokens, nan=0.0, posinf=0.0, neginf=0.0)
+            prefix_mask = torch.arange(action_horizon, device=self.device).view(1, -1, 1) < d
+
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
             device=self.device,
             dtype=latents_action.dtype,
             shift_override=sigma_shift,
         )
-        for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
-            timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
-
-            pred_action_posi = self._predict_action_noise_with_cache(
+        if action_denoise_runner is not None:
+            latents_action = action_denoise_runner(
                 latents_action=latents_action,
-                timestep_action=timestep_action,
                 context=context,
                 context_mask=context_mask,
                 video_kv_cache=video_kv_cache,
                 attention_mask=attention_mask,
                 video_seq_len=video_seq_len,
+                step_timesteps=infer_timesteps_action,
+                step_deltas=infer_deltas_action,
+                prefix_tokens=None if prefix_tokens is None else prefix_tokens[:, :action_horizon],
+                prefix_mask=prefix_mask,
             )
-            pred_action = pred_action_posi
+        else:
+            for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
+                timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
+                action_step_input = latents_action
+                timestep_step_input = timestep_action
+                if prefix_tokens is not None and prefix_mask is not None:
+                    prefix_slice = prefix_tokens[:, :action_horizon]
+                    action_step_input = torch.where(prefix_mask, prefix_slice, latents_action)
+                    timestep_step_input = timestep_action.expand(1, action_horizon).clone()
+                    timestep_step_input[:, :d] = 0
 
-            latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+                pred_action_posi = self._predict_action_noise_with_cache(
+                    latents_action=action_step_input,
+                    timestep_action=timestep_step_input,
+                    context=context,
+                    context_mask=context_mask,
+                    video_kv_cache=video_kv_cache,
+                    attention_mask=attention_mask,
+                    video_seq_len=video_seq_len,
+                )
+                pred_action = pred_action_posi
+
+                latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+                if prefix_tokens is not None and prefix_mask is not None:
+                    latents_action = torch.where(prefix_mask, prefix_tokens[:, :action_horizon], latents_action)
 
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
         }
 
     # ------------------------------------------------------------------
-    # RTC (Real-Time Chunking) inference
+    # Training-time RTC compatibility wrapper
     # ------------------------------------------------------------------
 
-    def _rtc_action_step(
-        self,
-        x_t: torch.Tensor,
-        time: torch.Tensor,
-        dt: torch.Tensor,
-        video_kv_cache: list[dict[str, torch.Tensor]],
-        attention_mask: torch.Tensor,
-        video_seq_len: int,
-        context: torch.Tensor,
-        context_mask: torch.Tensor,
-        prev_action_chunk: torch.Tensor,
-        d: int,
-        exec_h: int,
-        schedule: str,
-        max_guidance_weight: float,
-        mask_prefix_delay: bool,
-    ) -> torch.Tensor:
-        """Single RTC-guided denoising step.
-
-        Computes the velocity prediction via the gradient-enabled denoiser,
-        then applies prefix-guidance correction using the VJP of the predicted
-        clean action w.r.t. the current noisy action latents.
-
-        Args:
-            x_t: Current noisy action latents ``[1, action_horizon, action_dim]``.
-            time: Scalar diffusion timestep ``t``.
-            dt: Scalar step delta (negative for flow-matching t:1→0).
-            video_kv_cache: Prefilled video KV cache (per-layer K/V tensors).
-            attention_mask: Joint attention mask ``[total, total]``.
-            video_seq_len: Number of video tokens.
-            context: Text context embeddings ``[1, ctx_len, hidden]``.
-            context_mask: Text context mask ``[1, ctx_len]``.
-            prev_action_chunk: Previous action chunk ``[1, chunk_size, action_dim]``.
-            d: Inference delay (steps already executed).
-            exec_h: Execute horizon (steps under stronger guidance).
-            schedule: Prefix weight schedule name.
-            max_guidance_weight: Hard clamp for the guidance multiplier.
-            mask_prefix_delay: Whether to overwrite the delay prefix with
-                ``prev_action_chunk`` values before denoising.
-
-        Returns:
-            Updated action latents after one Euler step with RTC correction.
-        """
-        action_horizon = x_t.shape[1]
-        action_dim = x_t.shape[2]
-
-        # 1. Mask delay prefix — overwrite the already-executed steps
-        x_t_for_denoise = x_t
-        if mask_prefix_delay:
-            mask_time = torch.arange(action_horizon, device=x_t.device) < d
-            mask_time = mask_time.view(1, -1, 1)
-            # Align prev_chunk to action_dim (handle dim mismatches safely)
-            pc = prev_action_chunk
-            if pc.shape[-1] > action_dim:
-                pc = pc[..., :action_dim]
-            elif pc.shape[-1] < action_dim:
-                pad = torch.zeros(
-                    (*pc.shape[:-1], action_dim - pc.shape[-1]),
-                    device=pc.device,
-                    dtype=pc.dtype,
-                )
-                pc = torch.cat([pc, pad], dim=-1)
-            x_t_for_denoise = torch.where(mask_time, pc[:, :action_horizon], x_t)
-
-        # 2. Enable gradients on the (possibly masked) input
-        x_t_grad = x_t_for_denoise.detach().clone().requires_grad_(True)
-
-        # 3. Denoiser forward (gradient-enabled)
-        v_local = self._predict_action_noise_with_cache_grad(
-            latents_action=x_t_grad,
-            timestep_action=time.unsqueeze(0).to(dtype=x_t_grad.dtype, device=x_t_grad.device),
-            context=context,
-            context_mask=context_mask,
-            video_kv_cache=video_kv_cache,
-            attention_mask=attention_mask,
-            video_seq_len=video_seq_len,
-        )
-
-        # 4. Predicted clean action endpoint (flow-matching: x₁ = x_t − t·v_t)
-        x_action = x_t_grad - time * v_local
-
-        # 5. Build prefix attention weights
-        weights = get_prefix_weights(d, exec_h, action_horizon, schedule)
-        weights = weights.to(device=x_t.device, dtype=x_t.dtype).view(1, -1, 1)
-
-        # 6. Dim mask — only guide dimensions actually present in prev_chunk
-        provided_dim = min(prev_action_chunk.shape[-1], action_dim)
-        dim_mask = torch.arange(action_dim, device=x_t.device) < provided_dim
-        dim_mask = dim_mask.view(1, 1, -1).to(dtype=x_t.dtype)
-
-        # 7. Error signal between previous chunk and predicted clean action
-        pc_for_error = prev_action_chunk[..., :action_dim]
-        error = (pc_for_error[:, :action_horizon] - x_action) * weights * dim_mask
-
-        # 8. VJP: d(error⋅x_action)/dx  =  vjp(error)
-        correction = torch.autograd.grad(
-            outputs=x_action,
-            inputs=x_t_grad,
-            grad_outputs=error,
-            retain_graph=False,
-            create_graph=False,
-        )[0]
-
-        # 9. Guidance weight (strong early, weak near convergence)
-        time_scalar = time.to(dtype=torch.float32, device=x_t.device)
-        guidance_weight = compute_rtc_guidance_weight(time_scalar, max_guidance_weight)
-
-        # 10. Corrected velocity
-        v_t = v_local - guidance_weight * correction
-
-        # 11. Numerical safety
-        v_t = torch.nan_to_num(v_t, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # 12. Euler step: x_{t+dt} = x_t + dt ⋅ v_t
-        return x_t + dt * v_t
-
+    @torch.no_grad()
     def infer_action_with_rtc(
         self,
         prompt: Optional[str],
@@ -1224,7 +1212,6 @@ class FastWAM(torch.nn.Module):
         seed: Optional[int] = None,
         rand_device: str = "cpu",
         tiled: bool = False,
-        # ---- RTC-specific parameters ---------------------------------
         prev_action_chunk: Optional[torch.Tensor] = None,
         inference_delay: int = 0,
         execute_horizon: Optional[int] = None,
@@ -1233,193 +1220,40 @@ class FastWAM(torch.nn.Module):
         max_guidance_weight: float = 1.0,
         enable_rtc: bool = True,
     ) -> dict[str, Any]:
-        """Action-only inference with optional RTC prefix guidance.
-
-        When ``enable_rtc=True`` and ``prev_action_chunk`` is provided, each
-        denoising step applies prefix-guidance correction via VJP through the
-        action branch.  Otherwise behaviour is identical to
-        :meth:`infer_action`.
-        """
-        self.eval()
-        if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
-            raise ValueError(
-                "`infer_action_with_rtc` requires `video_attention_mask_mode='first_frame_causal'`."
-            )
-
-        # --- input validation (mirrors infer_action) ------------------------
-        if input_image.ndim == 3:
-            input_image = input_image.unsqueeze(0)
-        if input_image.ndim != 4 or input_image.shape[0] != 1 or input_image.shape[1] != 3:
-            raise ValueError(
-                f"`input_image` must have shape [1,3,H,W] or [3,H,W], got {tuple(input_image.shape)}"
-            )
-        _, _, height, width = input_image.shape
-        if height % 16 != 0 or width % 16 != 0:
-            raise ValueError(
-                f"`input_image` must be resized before infer, expected multiples of 16 but got HxW=({height},{width})"
-            )
-        if proprio is not None:
-            if self.proprio_dim is None:
-                raise ValueError("`proprio` was provided but `proprio_dim=None` so `proprio_encoder` is disabled.")
-            if proprio.ndim == 1:
-                proprio = proprio.unsqueeze(0)
-            elif proprio.ndim == 2 and proprio.shape[0] == 1:
-                pass
-            else:
-                raise ValueError(f"`proprio` must be [D] or [1,D], got shape {tuple(proprio.shape)}")
-            if proprio.shape[1] != self.proprio_dim:
-                raise ValueError(f"`proprio` last dim must be {self.proprio_dim}, got {proprio.shape[1]}")
-            proprio = proprio.to(device=self.device, dtype=self.torch_dtype)
-
-        # --- noise latents ---------------------------------------------------
-        generator = None if seed is None else torch.Generator(device=rand_device).manual_seed(seed)
-        latents_action = torch.randn(
-            (1, action_horizon, self.action_expert.action_dim),
-            generator=generator,
-            device=rand_device,
-            dtype=torch.float32,
-        ).to(device=self.device, dtype=self.torch_dtype)
-
-        # --- encode first-frame image ----------------------------------------
-        input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        first_frame_latents = self._encode_input_image_latents_tensor(
-            input_image=input_image, tiled=tiled
-        )
-        fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
-
-        # --- encode prompt / use cached context ------------------------------
-        use_prompt = prompt is not None
-        use_context = context is not None or context_mask is not None
-        if use_prompt and use_context:
-            raise ValueError("`prompt` and `context/context_mask` are mutually exclusive.")
-        if not use_prompt and not use_context:
-            raise ValueError("Either `prompt` or both `context/context_mask` must be provided.")
-
-        if use_prompt:
-            context, context_mask = self.encode_prompt(prompt)
-        else:
-            if context is None or context_mask is None:
-                raise ValueError("`context` and `context_mask` must be both provided together.")
-            if context.ndim == 2:
-                context = context.unsqueeze(0)
-            if context_mask.ndim == 1:
-                context_mask = context_mask.unsqueeze(0)
-            if context.ndim != 3 or context_mask.ndim != 2:
-                raise ValueError(
-                    f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
-                )
-            context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
-            context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
-        if proprio is not None:
-            context, context_mask = self._append_proprio_to_context(
+        del execute_horizon, mask_prefix_delay, prefix_attention_schedule, max_guidance_weight
+        if enable_rtc and prev_action_chunk is not None and inference_delay > 0:
+            return self.infer_action(
+                prompt=prompt,
+                input_image=input_image,
+                action_horizon=action_horizon,
+                proprio=proprio,
                 context=context,
                 context_mask=context_mask,
-                proprio=proprio,
+                negative_prompt=negative_prompt,
+                text_cfg_scale=text_cfg_scale,
+                num_inference_steps=num_inference_steps,
+                sigma_shift=sigma_shift,
+                seed=seed,
+                rand_device=rand_device,
+                tiled=tiled,
+                action_prefix=prev_action_chunk,
+                prefix_delay=inference_delay,
             )
-
-        # --- prefill video KV cache ------------------------------------------
-        timestep_video = torch.zeros(
-            (first_frame_latents.shape[0],),
-            dtype=first_frame_latents.dtype,
-            device=self.device,
-        )
-        video_pre = self.video_expert.pre_dit(
-            x=first_frame_latents,
-            timestep=timestep_video,
+        return self.infer_action(
+            prompt=prompt,
+            input_image=input_image,
+            action_horizon=action_horizon,
+            proprio=proprio,
             context=context,
             context_mask=context_mask,
-            action=None,
-            fuse_vae_embedding_in_latents=fuse_flag,
+            negative_prompt=negative_prompt,
+            text_cfg_scale=text_cfg_scale,
+            num_inference_steps=num_inference_steps,
+            sigma_shift=sigma_shift,
+            seed=seed,
+            rand_device=rand_device,
+            tiled=tiled,
         )
-        video_seq_len = int(video_pre["tokens"].shape[1])
-        attention_mask = self._build_mot_attention_mask(
-            video_seq_len=video_seq_len,
-            action_seq_len=latents_action.shape[1],
-            video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
-            device=video_pre["tokens"].device,
-        )
-        video_kv_cache = self.mot.prefill_video_cache(
-            video_tokens=video_pre["tokens"],
-            video_freqs=video_pre["freqs"],
-            video_t_mod=video_pre["t_mod"],
-            video_context_payload={
-                "context": video_pre["context"],
-                "mask": video_pre["context_mask"],
-            },
-            video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
-        )
-
-        # --- build inference schedule ----------------------------------------
-        infer_timesteps_action, infer_deltas_action = (
-            self.infer_action_scheduler.build_inference_schedule(
-                num_inference_steps=num_inference_steps,
-                device=self.device,
-                dtype=latents_action.dtype,
-                shift_override=sigma_shift,
-            )
-        )
-
-        # --- determine RTC mode ----------------------------------------------
-        use_rtc = (
-            enable_rtc
-            and prev_action_chunk is not None
-        )
-
-        if use_rtc:
-            exec_h = execute_horizon if execute_horizon is not None else action_horizon
-            d = max(0, min(inference_delay, action_horizon))
-            exec_h = min(exec_h, prev_action_chunk.shape[1])
-            prev_chunk = prev_action_chunk.to(
-                device=self.device, dtype=latents_action.dtype
-            )
-            if prev_chunk.ndim == 2:
-                prev_chunk = prev_chunk.unsqueeze(0)  # [1, T, D]
-            prev_chunk = torch.nan_to_num(prev_chunk, nan=0.0, posinf=0.0, neginf=0.0)
-
-        # --- denoising loop --------------------------------------------------
-        for step_t_action, step_delta_action in zip(
-            infer_timesteps_action, infer_deltas_action
-        ):
-            timestep_action = step_t_action.to(
-                dtype=latents_action.dtype, device=self.device
-            )
-
-            if use_rtc:
-                latents_action = self._rtc_action_step(
-                    x_t=latents_action,
-                    time=timestep_action,
-                    dt=step_delta_action,
-                    video_kv_cache=video_kv_cache,
-                    attention_mask=attention_mask,
-                    video_seq_len=video_seq_len,
-                    context=context,
-                    context_mask=context_mask,
-                    prev_action_chunk=prev_chunk,
-                    d=d,
-                    exec_h=exec_h,
-                    schedule=prefix_attention_schedule,
-                    max_guidance_weight=max_guidance_weight,
-                    mask_prefix_delay=mask_prefix_delay,
-                )
-            else:
-                pred_action_posi = self._predict_action_noise_with_cache(
-                    latents_action=latents_action,
-                    timestep_action=timestep_action.unsqueeze(0).to(
-                        dtype=latents_action.dtype, device=self.device
-                    ),
-                    context=context,
-                    context_mask=context_mask,
-                    video_kv_cache=video_kv_cache,
-                    attention_mask=attention_mask,
-                    video_seq_len=video_seq_len,
-                )
-                latents_action = self.infer_action_scheduler.step(
-                    pred_action_posi, step_delta_action, latents_action
-                )
-
-        return {
-            "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
-        }
 
     @torch.no_grad()
     def infer(

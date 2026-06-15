@@ -44,20 +44,37 @@ def precompute_freqs_cis_3d(dim: int, end: int = 1024, theta: float = 10000.0):
 
 
 def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
-    # 1d rope precompute
+    # 1d rope precompute — returns interleaved cos/sin real tensor [S, dim]
+    # (avoiding complex types so torch.compile can fuse the entire graph)
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)
                    [: (dim // 2)].double() / dim))
     freqs = torch.outer(torch.arange(end, device=freqs.device), freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
+    freqs_cis = torch.cat([torch.cos(freqs), torch.sin(freqs)], dim=-1).float()
     return freqs_cis
 
 
 def rope_apply(x, freqs, num_heads):
+    """Apply rotary position embeddings using real-valued operations.
+
+    Uses the identity  (a+bi)*(cos θ + i sin θ) = (a cos θ - b sin θ) + i (a sin θ + b cos θ)
+    so that torch.compile can fuse the operation without complex-number graph breaks.
+
+    ``freqs`` is a real tensor [S, D] from :func:`precompute_freqs_cis`,
+    with cos in the first half and sin in the second half of the last dim.
+    """
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
-    x_out = torch.view_as_complex(x.to(torch.float64).reshape(
-        x.shape[0], x.shape[1], x.shape[2], -1, 2))
-    freqs = freqs.to(torch.complex64) if freqs.device.type == "npu" else freqs
-    x_out = torch.view_as_real(x_out * freqs).flatten(2)
+    x_even, x_odd = x[..., 0::2], x[..., 1::2]
+    # freqs: [S, D] real — first D/2 is cos, second D/2 is sin
+    cos, sin = freqs.chunk(2, dim=-1)
+    cos = cos.to(dtype=x.dtype)
+    sin = sin.to(dtype=x.dtype)
+    # Broadcast freqs: [S, rope_dim] → add head and batch dims
+    while cos.ndim < x_even.ndim:
+        cos = cos.unsqueeze(0)
+        sin = sin.unsqueeze(0)
+    x_rotated_even = x_even * cos - x_odd * sin
+    x_rotated_odd = x_even * sin + x_odd * cos
+    x_out = torch.stack([x_rotated_even, x_rotated_odd], dim=-1).flatten(2)
     return x_out.to(x.dtype)
 
 

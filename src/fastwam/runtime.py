@@ -133,6 +133,14 @@ def create_fastwam(
     if not isinstance(loss, dict):
         raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
 
+    training_rtc = loss.get("training_rtc", {})
+    if isinstance(training_rtc, DictConfig):
+        training_rtc = OmegaConf.to_container(training_rtc, resolve=True)
+    if training_rtc is None:
+        training_rtc = {}
+    if not isinstance(training_rtc, dict):
+        raise ValueError(f"`loss.training_rtc` must be dict-like, got {type(training_rtc)}")
+
     return FastWAM.from_wan22_pretrained(
         device=device,
         torch_dtype=model_dtype,
@@ -155,6 +163,9 @@ def create_fastwam(
         action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
         loss_lambda_video=float(loss.get("lambda_video", 1.0)),
         loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+        training_rtc_enabled=bool(training_rtc.get("enabled", False)),
+        training_rtc_max_delay=int(training_rtc.get("max_delay", 10)),
+        training_rtc_delay_distribution=str(training_rtc.get("delay_distribution", "uniform")),
     )
 
 

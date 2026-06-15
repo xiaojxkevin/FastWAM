@@ -33,9 +33,7 @@ import asyncio
 import hashlib
 import http
 import logging
-import queue
 import sys
-import threading
 import time
 import traceback
 from pathlib import Path
@@ -54,62 +52,207 @@ import websockets.frames
 
 from .msgpack_numpy import packb, unpackb
 
-from fastwam.runtime import create_fastwam, create_fastwam_idm
+from fastwam.runtime import create_fastwam
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.transforms.action_state_merger import ConcatLeftAlign
-from fastwam.utils.video_io import save_mp4
-from fastwam.utils.fs import ensure_dir
 
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Video saver (background thread)
-# ---------------------------------------------------------------------------
+class FastWAMCudaGraphRunner:
+    """Reusable CUDA-graph runner for fixed-shape uncond action denoising."""
 
-class VideoSaverWorker:
-    """Background thread that saves PIL frame sequences to MP4 files via a queue.
+    def __init__(self, model, action_horizon: int, num_inference_steps: int, device: str):
+        self._model = model
+        self._action_horizon = int(action_horizon)
+        self._num_inference_steps = int(num_inference_steps)
+        self._device = torch.device(device)
+        self._graph: Optional[torch.cuda.CUDAGraph] = None
+        self._static_latents_action: Optional[torch.Tensor] = None
+        self._static_context: Optional[torch.Tensor] = None
+        self._static_context_mask: Optional[torch.Tensor] = None
+        self._static_prefix_tokens: Optional[torch.Tensor] = None
+        self._static_prefix_mask: Optional[torch.Tensor] = None
+        self._static_step_timesteps: Optional[torch.Tensor] = None
+        self._static_step_deltas: Optional[torch.Tensor] = None
+        self._static_attention_mask: Optional[torch.Tensor] = None
+        self._static_video_kv_cache: Optional[list[dict[str, torch.Tensor]]] = None
+        self._captured_signature: Optional[tuple] = None
 
-    The queue decouples GPU inference latency from disk I/O — ``save_mp4``
-    uses ``imageio`` / ffmpeg underneath which is a blocking subprocess call.
-    """
+    def _shape_signature(
+        self,
+        latents_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        prefix_tokens: Optional[torch.Tensor],
+        prefix_mask: Optional[torch.Tensor],
+    ) -> tuple:
+        cache_sig = tuple((tuple(layer["k"].shape), tuple(layer["v"].shape)) for layer in video_kv_cache)
+        return (
+            tuple(latents_action.shape),
+            tuple(context.shape),
+            tuple(context_mask.shape),
+            tuple(attention_mask.shape),
+            cache_sig,
+            None if prefix_tokens is None else tuple(prefix_tokens.shape),
+            None if prefix_mask is None else tuple(prefix_mask.shape),
+            self._num_inference_steps,
+        )
 
-    def __init__(self, output_dir: Path, fps: int = 15):
-        self._queue: queue.Queue = queue.Queue()
-        self._output_dir = output_dir
-        self._fps = fps
-        self._thread: Optional[threading.Thread] = None
+    def _ensure_captured(
+        self,
+        latents_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+        step_timesteps: torch.Tensor,
+        step_deltas: torch.Tensor,
+        prefix_tokens: Optional[torch.Tensor],
+        prefix_mask: Optional[torch.Tensor],
+    ) -> None:
+        signature = self._shape_signature(
+            latents_action=latents_action,
+            context=context,
+            context_mask=context_mask,
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            prefix_tokens=prefix_tokens,
+            prefix_mask=prefix_mask,
+        )
+        if self._graph is not None and self._captured_signature == signature:
+            return
 
-    def start(self) -> None:
-        ensure_dir(self._output_dir)
-        self._thread = threading.Thread(target=self._run, daemon=True, name="video-saver")
-        self._thread.start()
-        logger.info("VideoSaverWorker started (output_dir=%s, fps=%d)", self._output_dir, self._fps)
+        if not torch.cuda.is_available() or not str(self._device).startswith("cuda"):
+            raise RuntimeError("CUDA Graph runner requires a CUDA device.")
+        if latents_action.device.type != "cuda":
+            raise RuntimeError("CUDA Graph runner requires CUDA tensors.")
 
-    def stop(self, timeout: float = 30.0) -> None:
-        self._queue.put(None)  # sentinel
-        if self._thread is not None:
-            self._thread.join(timeout=timeout)
-            if self._thread.is_alive():
-                logger.warning("VideoSaverWorker did not stop within %s seconds", timeout)
+        self._static_latents_action = latents_action.clone()
+        self._static_context = context.clone()
+        self._static_context_mask = context_mask.clone()
+        self._static_prefix_tokens = (
+            torch.zeros_like(latents_action) if prefix_tokens is None else prefix_tokens.clone()
+        )
+        self._static_prefix_mask = (
+            torch.zeros((1, self._action_horizon, 1), dtype=torch.bool, device=self._device)
+            if prefix_mask is None else prefix_mask.clone()
+        )
+        self._static_step_timesteps = step_timesteps.clone()
+        self._static_step_deltas = step_deltas.clone()
+        self._static_attention_mask = attention_mask.clone()
+        self._static_video_kv_cache = [
+            {"k": layer["k"].clone(), "v": layer["v"].clone()} for layer in video_kv_cache
+        ]
 
-    def enqueue(self, frames: list, filename: str) -> None:
-        self._queue.put((frames, filename))
+        stream = torch.cuda.Stream(device=self._device)
+        torch.cuda.synchronize(device=self._device)
+        with torch.cuda.stream(stream):
+            for _ in range(2):
+                _ = self._model._predict_action_noise_with_cache(
+                    latents_action=self._static_latents_action,
+                    timestep_action=self._static_step_timesteps[0].expand(1, self._action_horizon),
+                    context=self._static_context,
+                    context_mask=self._static_context_mask,
+                    video_kv_cache=self._static_video_kv_cache,
+                    attention_mask=self._static_attention_mask,
+                    video_seq_len=video_seq_len,
+                )
+        torch.cuda.current_stream(device=self._device).wait_stream(stream)
 
-    def _run(self) -> None:
-        while True:
-            item = self._queue.get()
-            if item is None:
-                break
-            frames, filename = item
-            out_path = str(self._output_dir / filename)
-            try:
-                save_mp4(frames, out_path, fps=self._fps)
-                logger.info("Saved video: %s", out_path)
-            except Exception:
-                logger.exception("Failed to save video: %s", out_path)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for i in range(self._num_inference_steps):
+                timestep_step_input = self._static_step_timesteps[i].expand(1, self._action_horizon).clone()
+                timestep_step_input = torch.where(
+                    self._static_prefix_mask.squeeze(-1),
+                    torch.zeros_like(timestep_step_input),
+                    timestep_step_input,
+                )
+                action_step_input = torch.where(
+                    self._static_prefix_mask,
+                    self._static_prefix_tokens,
+                    self._static_latents_action,
+                )
+                pred_action = self._model._predict_action_noise_with_cache(
+                    latents_action=action_step_input,
+                    timestep_action=timestep_step_input,
+                    context=self._static_context,
+                    context_mask=self._static_context_mask,
+                    video_kv_cache=self._static_video_kv_cache,
+                    attention_mask=self._static_attention_mask,
+                    video_seq_len=video_seq_len,
+                )
+                updated = self._model.infer_action_scheduler.step(
+                    pred_action, self._static_step_deltas[i], self._static_latents_action
+                )
+                self._static_latents_action.copy_(updated)
+                self._static_latents_action.copy_(
+                    torch.where(self._static_prefix_mask, self._static_prefix_tokens, self._static_latents_action)
+                )
+        self._graph = graph
+        self._captured_signature = signature
+
+    def run(
+        self,
+        latents_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        video_kv_cache: list[dict[str, torch.Tensor]],
+        attention_mask: torch.Tensor,
+        video_seq_len: int,
+        step_timesteps: torch.Tensor,
+        step_deltas: torch.Tensor,
+        prefix_tokens: Optional[torch.Tensor] = None,
+        prefix_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self._graph is None:
+            self._ensure_captured(
+                latents_action=latents_action,
+                context=context,
+                context_mask=context_mask,
+                video_kv_cache=video_kv_cache,
+                attention_mask=attention_mask,
+                video_seq_len=video_seq_len,
+                step_timesteps=step_timesteps,
+                step_deltas=step_deltas,
+                prefix_tokens=prefix_tokens,
+                prefix_mask=prefix_mask,
+            )
+        else:
+            assert self._static_latents_action is not None
+            assert self._static_context is not None
+            assert self._static_context_mask is not None
+            assert self._static_prefix_tokens is not None
+            assert self._static_prefix_mask is not None
+            assert self._static_step_timesteps is not None
+            assert self._static_step_deltas is not None
+            assert self._static_attention_mask is not None
+            assert self._static_video_kv_cache is not None
+            self._static_latents_action.copy_(latents_action)
+            self._static_context.copy_(context)
+            self._static_context_mask.copy_(context_mask)
+            self._static_prefix_tokens.copy_(torch.zeros_like(self._static_prefix_tokens) if prefix_tokens is None else prefix_tokens)
+            if prefix_mask is None:
+                self._static_prefix_mask.zero_()
+            else:
+                self._static_prefix_mask.copy_(prefix_mask)
+            self._static_step_timesteps.copy_(step_timesteps)
+            self._static_step_deltas.copy_(step_deltas)
+            self._static_attention_mask.copy_(attention_mask)
+            for src_layer, dst_layer in zip(video_kv_cache, self._static_video_kv_cache):
+                dst_layer["k"].copy_(src_layer["k"])
+                dst_layer["v"].copy_(src_layer["v"])
+
+        assert self._graph is not None
+        self._graph.replay()
+        assert self._static_latents_action is not None
+        return self._static_latents_action
 
 
 # ---------------------------------------------------------------------------
@@ -134,14 +277,18 @@ class FastWAMModelWrapper:
         self._model_dtype = _dtype_map[dtype_str]
         self._device = str(cfg.get("device", "cuda"))
 
-        # --- mode -----------------------------------------------------------
+        # --- mode: only uncond is supported --------------------------------
         mode = str(cfg.get("mode", "uncond"))
-        if mode not in ("uncond", "joint", "idm"):
-            raise ValueError(f"Unknown mode: {mode!r}. Must be one of: uncond, joint, idm")
-        self._mode = mode
+        if mode in ("joint", "idm"):
+            raise NotImplementedError(
+                f"Mode {mode!r} is not supported. Only 'uncond' mode is available."
+            )
+        if mode != "uncond":
+            raise ValueError(f"Unknown mode: {mode!r}. Must be 'uncond'.")
 
-        # --- build model (mode-dependent factory) ---------------------------
-        _factory_kwargs = dict(
+        # --- build model ---------------------------------------------------
+        logger.info("Creating FastWAM model …")
+        self._model = create_fastwam(
             model_id=str(model_cfg["model_id"]),
             tokenizer_model_id=str(model_cfg["tokenizer_model_id"]),
             tokenizer_max_len=int(model_cfg.get("tokenizer_max_len", 128)),
@@ -158,14 +305,8 @@ class FastWAMModelWrapper:
             model_dtype=self._model_dtype,
             device=self._device,
         )
-        if self._mode == "idm":
-            logger.info("Creating FastWAM model (IDM mode) …")
-            self._model = create_fastwam_idm(**_factory_kwargs)
-        else:
-            logger.info("Creating FastWAM model (mode=%s) …", self._mode)
-            self._model = create_fastwam(**_factory_kwargs)
 
-        # --- load finetuned checkpoint ---------------------------------------
+        # --- load finetuned checkpoint -------------------------------------
         ckpt_path = Path(cfg["checkpoint_path"])
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
@@ -173,7 +314,7 @@ class FastWAMModelWrapper:
         self._model.load_checkpoint(str(ckpt_path))
         self._model = self._model.to(self._device).eval()
 
-        # --- build processor & load normalisation stats ----------------------
+        # --- build processor & load normalisation stats --------------------
         logger.info("Loading dataset normalisation stats …")
         shape_meta = data_cfg["shape_meta"]
         self._processor = FastWAMProcessor(
@@ -197,7 +338,7 @@ class FastWAMModelWrapper:
         dataset_stats = load_dataset_stats_from_json(str(stats_path))
         self._processor.set_normalizer_from_stats(dataset_stats)
 
-        # --- text context mode ------------------------------------------------
+        # --- text context mode ----------------------------------------------
         self._text_encoder_loaded = bool(model_cfg.get("load_text_encoder", True))
         self._text_cache_dir: Optional[Path] = None
         self._context_len: int = int(model_cfg.get("tokenizer_max_len", 128))
@@ -224,26 +365,171 @@ class FastWAMModelWrapper:
 
         # --- inference params ------------------------------------------------
         self._action_horizon = int(inf_cfg.get("action_horizon", 32))
-        self._num_video_frames = int(inf_cfg.get("num_video_frames", self._action_horizon + 1))
+        self._proprio_dim = int(data_cfg.get("proprio_output_dim", 14))
         self._num_inference_steps = int(inf_cfg.get("num_inference_steps", 20))
         self._seed = inf_cfg.get("seed")  # None or int
+        self._accel_cfg = dict(inf_cfg.get("acceleration", {}))
+        self._accel_enabled = bool(self._accel_cfg.get("enabled", False))
+        self._torch_compile_enabled = bool(self._accel_cfg.get("torch_compile", False))
+        self._compile_prefill_enabled = bool(self._accel_cfg.get("compile_prefill", True))
+        self._compile_action_enabled = bool(self._accel_cfg.get("compile_action", True))
+        self._cuda_graph_enabled = bool(self._accel_cfg.get("cuda_graph", False))
+        self._compile_mode = str(self._accel_cfg.get("compile_mode", "default"))
+        self._compiled_prefill = None
+        self._compiled_action_step = None
+        self._cuda_graph_runner = None
 
-        # --- video saver (joint / idm modes only) ---------------------------
-        self._video_saver: Optional[VideoSaverWorker] = None
-        self._video_output_dir: Optional[Path] = None
-        if self._mode in ("joint", "idm"):
-            video_out_str = str(cfg.get("video_output_dir", "./outputs/videos"))
-            self._video_output_dir = Path(video_out_str)
-            if not self._video_output_dir.is_absolute():
-                self._video_output_dir = _PROJECT_ROOT / self._video_output_dir
-            video_fps = int(cfg.get("video_fps", 15))
-            self._video_saver = VideoSaverWorker(self._video_output_dir, fps=video_fps)
-            self._video_saver.start()
+        if self._accel_enabled and self._torch_compile_enabled and hasattr(torch, "compile"):
+            self._maybe_compile_model()
+        if self._accel_enabled and self._cuda_graph_enabled:
+            if str(self._device).startswith("cuda"):
+                self._cuda_graph_runner = FastWAMCudaGraphRunner(
+                    model=self._model,
+                    action_horizon=self._action_horizon,
+                    num_inference_steps=self._num_inference_steps,
+                    device=self._device,
+                )
+                logger.info("Enabled CUDA Graph runner for uncond action denoising.")
+            else:
+                logger.warning(
+                    "CUDA Graph acceleration requires a CUDA device (current=%s); "
+                    "falling back to torch.compile/eager.",
+                    self._device,
+                )
+
+        # ---- init-time warmup + CUDA graph pre-capture -------------------
+        self._init_warmup_and_capture()
 
         logger.info(
-            "FastWAM server ready | device=%s dtype=%s mode=%s action_horizon=%d",
-            self._device, dtype_str, self._mode, self._action_horizon,
+            "FastWAM server ready | device=%s dtype=%s action_horizon=%d",
+            self._device, dtype_str, self._action_horizon,
         )
+
+    # -------------------------------------------------------------------
+    # Inference acceleration
+    # -------------------------------------------------------------------
+
+    def _maybe_compile_model(self) -> None:
+        compile_kwargs = {} if self._compile_mode == "default" else {"mode": self._compile_mode}
+        try:
+            if self._compile_prefill_enabled:
+                self._compiled_prefill = torch.compile(self._model.mot.prefill_video_cache, **compile_kwargs)
+                self._model.mot.prefill_video_cache = self._compiled_prefill
+                logger.info("Enabled torch.compile for MoT video KV prefill (mode=%s)", self._compile_mode)
+            if self._compile_action_enabled:
+                self._compiled_action_step = torch.compile(
+                    self._model.mot.forward_action_with_video_cache, **compile_kwargs
+                )
+                self._model.mot.forward_action_with_video_cache = self._compiled_action_step
+                logger.info("Enabled torch.compile for MoT cached action forward (mode=%s)", self._compile_mode)
+        except Exception:
+            logger.exception("torch.compile setup failed; falling back to eager inference.")
+            self._compiled_prefill = None
+            self._compiled_action_step = None
+
+    # -------------------------------------------------------------------
+    # Init-time warmup & CUDA graph pre-capture
+    # -------------------------------------------------------------------
+    _WARMUP_ITERS: int = 2  # hard-coded: enough to trigger JIT + kernel warmup
+
+    def _init_warmup_and_capture(self) -> None:
+        """Run warmup and pre-capture CUDA graphs during ``__init__``.
+
+        Eliminates cold-start latency on the very first real request:
+        1. Dummy inference triggers ``torch.compile`` JIT compilation.
+        2. CUDA graph is pre-captured so ``graph.replay()`` is ready immediately.
+
+        If anything fails, acceleration degrades gracefully — the eager /
+        ``torch.compile`` path still works for subsequent requests.
+        """
+        if not self._accel_enabled:
+            return
+
+        try:
+            # Resolve text context (default prompt via cache, or dummy).
+            _warmup_prompt = DEFAULT_PROMPT.format(
+                task="take the cloth from the basket and fold the cloth."
+            )
+            try:
+                infer_prompt, context, context_mask = self._get_text_context(_warmup_prompt)
+            except Exception:
+                logger.warning(
+                    "Could not resolve text context for init warmup; using dummy context."
+                )
+                infer_prompt = None
+                context = torch.zeros(
+                    (1, self._context_len, self._model.text_dim),
+                    device=self._device,
+                    dtype=self._model_dtype,
+                )
+                context_mask = torch.ones(
+                    (1, self._context_len), dtype=torch.bool, device=self._device
+                )
+
+            image = torch.zeros(
+                (1, 3, 384, 320), device=self._device, dtype=self._model_dtype
+            )
+            proprio = torch.zeros(
+                (1, self._proprio_dim), device=self._device, dtype=self._model_dtype
+            )
+
+            # Phase 1: warmup — triggers torch.compile JIT + CUDA kernel warmup.
+            for _ in range(self._WARMUP_ITERS):
+                with torch.no_grad():
+                    self._model.infer_action(
+                        prompt=infer_prompt,
+                        context=context,
+                        context_mask=context_mask,
+                        input_image=image,
+                        action_horizon=self._action_horizon,
+                        proprio=proprio,
+                        num_inference_steps=self._num_inference_steps,
+                        seed=self._seed,
+                    )
+            if torch.cuda.is_available() and str(self._device).startswith("cuda"):
+                torch.cuda.synchronize()
+            logger.info(
+                "Init warmup completed (iters=%d, compile_mode=%s).",
+                self._WARMUP_ITERS,
+                self._compile_mode,
+            )
+
+            # Phase 2: pre-capture CUDA graph so first real request replays instantly.
+            if self._cuda_graph_runner is not None:
+                # Capture with a non-zero prefix so both torch.where branches
+                # (prefix & suffix) are exercised.  The same graph handles
+                # RTC and non-RTC because shapes are identical — only the
+                # boolean values in prefix_mask differ across requests.
+                dummy_prefix = torch.zeros(
+                    (1, self._action_horizon, self._model.action_expert.action_dim),
+                    device=self._device,
+                    dtype=self._model_dtype,
+                )
+                with torch.no_grad():
+                    self._model.infer_action(
+                        prompt=infer_prompt,
+                        context=context,
+                        context_mask=context_mask,
+                        input_image=image,
+                        action_horizon=self._action_horizon,
+                        proprio=proprio,
+                        num_inference_steps=self._num_inference_steps,
+                        seed=self._seed,
+                        action_prefix=dummy_prefix,
+                        prefix_delay=min(5, self._action_horizon),
+                        action_denoise_runner=self._cuda_graph_runner.run,
+                    )
+                if torch.cuda.is_available() and str(self._device).startswith("cuda"):
+                    torch.cuda.synchronize()
+                logger.info("CUDA graph pre-captured successfully.")
+
+        except Exception:
+            logger.exception(
+                "Init warmup/capture failed; serving will continue with eager/compile path."
+            )
+
+    def _maybe_warmup_uncond(self, prompt: Optional[str], context: Optional[torch.Tensor], context_mask: Optional[torch.Tensor]) -> None:
+        """No-op: warmup already happened in ``_init_warmup_and_capture`` during init."""
 
     # -------------------------------------------------------------------
     # Image preprocessing (robotwin layout — matches training dataset)
@@ -283,7 +569,7 @@ class FastWAMModelWrapper:
         state_key = self._processor.shape_meta["state"][0]["key"]
         state_batch = {
             "state": {
-                state_key: torch.as_tensor(state, dtype=torch.float32).unsqueeze(0),
+                state_key: torch.as_tensor(np.array(state, dtype=np.float32, copy=True)).unsqueeze(0),
             }
         }
         state_batch = self._processor.action_state_transform(state_batch)
@@ -303,14 +589,25 @@ class FastWAMModelWrapper:
         denorm = normalizer.backward(action.to(dtype=torch.float32, device="cpu"))
         return denorm.numpy()
 
+    def _normalize_action(self, action: np.ndarray | torch.Tensor) -> torch.Tensor:
+        """Apply the same z-score normalisation used by the action dataset."""
+        if not isinstance(action, torch.Tensor):
+            action = torch.as_tensor(np.array(action, dtype=np.float32, copy=True))
+        else:
+            action = action.detach().to(dtype=torch.float32, device="cpu")
+        if action.ndim == 2:
+            action = action.unsqueeze(0)
+        action_key = self._processor.shape_meta["action"][0]["key"]
+        normalizer = self._processor.normalizer.normalizers["action"][action_key]
+        norm_action = normalizer.forward(action)
+        return norm_action.to(device=self._device, dtype=self._model_dtype)
+
     # -------------------------------------------------------------------
     # Lifecycle
     # -------------------------------------------------------------------
 
     def shutdown(self) -> None:
-        """Gracefully stop the video saver thread if running."""
-        if self._video_saver is not None:
-            self._video_saver.stop()
+        """Graceful shutdown (no-op for uncond mode)."""
 
     # -------------------------------------------------------------------
     # Text context (cache or online encoder)
@@ -374,87 +671,62 @@ class FastWAMModelWrapper:
     # -------------------------------------------------------------------
 
     def infer(self, observation: dict[str, Any], index: int = 0) -> dict[str, Any]:
-        """Run a single synchronous inference step.
+        """Run a single synchronous action-only inference step.
 
         Parameters
         ----------
         observation : dict
             ``{"state": ndarray[14], "images": {...}, "prompt": str}``
             Optional RTC fields:
-            ``prev_action_chunk``, ``inference_delay``, ``execute_horizon``,
-            ``num_steps``, ``mask_prefix_delay``, ``prefix_attention_schedule``,
-            ``max_guidance_weight``, ``enable_rtc``.
+            ``prev_action_chunk``, ``inference_delay``, ``num_steps``, ``enable_rtc``.
         index : int
-            Per-connection step counter; server generates and returns this.
+            Per-connection step counter.
 
         Returns
         -------
         dict
             ``{"index": int, "actions": ndarray[T,14], "server_timing": {...}}``.
         """
-
         image_tensor = self._preprocess_images(observation["images"])
         proprio = self._normalize_state(observation["state"])
-        prompt = DEFAULT_PROMPT.format(task=observation.get("prompt", "take the cloth from the basket and fold the cloth."))
-
-        infer_prompt, context, context_mask = self._get_text_context(prompt)
-
-        # --- extract RTC fields (all optional) -------------------------------
-        rtc_kwargs = {
-            "inference_delay": int(observation.get("inference_delay", 0)),
-            "execute_horizon": observation.get("execute_horizon"),
-            "mask_prefix_delay": bool(observation.get("mask_prefix_delay", True)),
-            "prefix_attention_schedule": str(observation.get("prefix_attention_schedule", "linear")),
-            "max_guidance_weight": float(observation.get("max_guidance_weight", 1.0)),
-            "enable_rtc": bool(observation.get("enable_rtc", False)),
-        }
-        # convert prev_action_chunk from numpy to torch if present
-        raw_prev = observation.get("prev_action_chunk")
-        if raw_prev is not None:
-            rtc_kwargs["prev_action_chunk"] = torch.from_numpy(
-                np.asarray(raw_prev, dtype=np.float32)
-            ).unsqueeze(0)  # [1, T, D]
-        else:
-            rtc_kwargs["prev_action_chunk"] = None
-
-        # num_steps override
-        num_steps_override = observation.get("num_steps")
-        if num_steps_override is not None:
-            rtc_kwargs["num_inference_steps"] = int(num_steps_override)
-
-        if self._mode == "uncond":
-            return self._infer_uncond(image_tensor, proprio, infer_prompt,
-                                      context, context_mask, index, rtc_kwargs)
-        elif self._mode == "joint":
-            return self._infer_joint(image_tensor, proprio, infer_prompt,
-                                     context, context_mask, index)
-        elif self._mode == "idm":
-            return self._infer_idm(image_tensor, proprio, infer_prompt,
-                                   context, context_mask, index, rtc_kwargs)
-        else:
-            raise RuntimeError(f"Unsupported mode: {self._mode!r}")
-
-    def _infer_uncond(
-        self, image_tensor: torch.Tensor, proprio: torch.Tensor,
-        prompt: Optional[str], context: Optional[torch.Tensor],
-        context_mask: Optional[torch.Tensor], index: int,
-        rtc_kwargs: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Action-only inference via ``infer_action`` or ``infer_action_with_rtc``."""
-        rtc = rtc_kwargs or {}
-        use_rtc = (
-            rtc.get("enable_rtc", False)
-            and rtc.get("prev_action_chunk") is not None
+        prompt = DEFAULT_PROMPT.format(
+            task=observation.get("prompt", "take the cloth from the basket and fold the cloth.")
         )
 
+        infer_prompt, context, context_mask = self._get_text_context(prompt)
+        self._maybe_warmup_uncond(infer_prompt, context, context_mask)
+
+        # --- RTC prefix fields (all optional) ------------------------------
+        rtc = {
+            "inference_delay": int(observation.get("inference_delay", 0)),
+            "enable_rtc": bool(observation.get("enable_rtc", False)),
+        }
+        raw_prev = observation.get("prev_action_chunk")
+        rtc["prev_action_chunk"] = (
+            self._normalize_action(np.asarray(raw_prev, dtype=np.float32))
+            if raw_prev is not None else None
+        )
+        num_steps_override = observation.get("num_steps")
+        if num_steps_override is not None:
+            rtc["num_inference_steps"] = int(num_steps_override)
+
+        use_rtc = rtc["enable_rtc"] and rtc["prev_action_chunk"] is not None
+        num_steps = rtc.get("num_inference_steps", self._num_inference_steps)
+
+        # --- CUDA graph runner (if shapes match) ---------------------------
+        runner = None
+        if (
+            self._cuda_graph_runner is not None
+            and num_steps == self._num_inference_steps
+            and str(self._device).startswith("cuda")
+        ):
+            runner = self._cuda_graph_runner.run
+
         infer_t0 = time.perf_counter()
-        if use_rtc:
-            num_steps = rtc.get("num_inference_steps", self._num_inference_steps)
+        try:
             with torch.no_grad():
-                # no_grad is safe here — RTC guidance uses its own grad context
-                # inside _rtc_action_step via requires_grad_ on the action input.
-                pred = self._model.infer_action_with_rtc(
-                    prompt=prompt,
+                pred = self._model.infer_action(
+                    prompt=infer_prompt,
                     context=context,
                     context_mask=context_mask,
                     input_image=image_tensor,
@@ -462,26 +734,31 @@ class FastWAMModelWrapper:
                     proprio=proprio,
                     num_inference_steps=num_steps,
                     seed=self._seed,
-                    prev_action_chunk=rtc["prev_action_chunk"],
-                    inference_delay=rtc["inference_delay"],
-                    execute_horizon=rtc["execute_horizon"],
-                    mask_prefix_delay=rtc["mask_prefix_delay"],
-                    prefix_attention_schedule=rtc["prefix_attention_schedule"],
-                    max_guidance_weight=rtc["max_guidance_weight"],
-                    enable_rtc=True,
+                    action_prefix=rtc["prev_action_chunk"] if use_rtc else None,
+                    prefix_delay=rtc["inference_delay"] if use_rtc else 0,
+                    action_denoise_runner=runner,
                 )
-        else:
+        except Exception:
+            if runner is None:
+                raise
+            logger.exception(
+                "CUDA Graph action runner failed; disabling and retrying eager/compiled path."
+            )
+            self._cuda_graph_runner = None
             with torch.no_grad():
                 pred = self._model.infer_action(
-                    prompt=prompt,
+                    prompt=infer_prompt,
                     context=context,
                     context_mask=context_mask,
                     input_image=image_tensor,
                     action_horizon=self._action_horizon,
                     proprio=proprio,
-                    num_inference_steps=self._num_inference_steps,
+                    num_inference_steps=num_steps,
                     seed=self._seed,
+                    action_prefix=rtc["prev_action_chunk"] if use_rtc else None,
+                    prefix_delay=rtc["inference_delay"] if use_rtc else 0,
                 )
+
         infer_ms = (time.perf_counter() - infer_t0) * 1000.0
         actions = self._denormalize_action(pred["action"])[0]
         result: dict[str, Any] = {
@@ -491,89 +768,8 @@ class FastWAMModelWrapper:
         }
         if use_rtc:
             result["rtc_applied"] = True
+            result["rtc_mode"] = "training_time_prefix"
         return result
-
-    def _infer_joint(
-        self, image_tensor: torch.Tensor, proprio: torch.Tensor,
-        prompt: Optional[str], context: Optional[torch.Tensor],
-        context_mask: Optional[torch.Tensor], index: int,
-    ) -> dict[str, Any]:
-        """Joint video+action inference; video saved locally by background thread."""
-        infer_t0 = time.perf_counter()
-        with torch.no_grad():
-            pred = self._model.infer_joint(
-                prompt=prompt,
-                context=context,
-                context_mask=context_mask,
-                input_image=image_tensor,
-                num_video_frames=self._num_video_frames,
-                action_horizon=self._action_horizon,
-                proprio=proprio,
-                num_inference_steps=self._num_inference_steps,
-                seed=self._seed,
-                test_action_with_infer_action=False,
-            )
-        infer_ms = (time.perf_counter() - infer_t0) * 1000.0
-        actions = self._denormalize_action(pred["action"])[0]
-
-        video_filename = f"index_{index:06d}.mp4"
-        self._video_saver.enqueue(pred["video"], video_filename)  # type: ignore[union-attr]
-        video_path = str(self._video_output_dir / video_filename)  # type: ignore[operator]
-
-        return {
-            "index": index,
-            "actions": actions.astype(np.float32),
-            "video_path": video_path,
-            "server_timing": {"infer_ms": round(infer_ms, 3)},
-        }
-
-    def _infer_idm(
-        self, image_tensor: torch.Tensor, proprio: torch.Tensor,
-        prompt: Optional[str], context: Optional[torch.Tensor],
-        context_mask: Optional[torch.Tensor], index: int,
-        rtc_kwargs: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """IDM two-stage inference; video saved locally by background thread.
-
-        .. note::
-
-            RTC prefix guidance for IDM stage 2 is not yet implemented.
-            RTC fields are accepted but silently ignored — the standard
-            two-stage pipeline is used regardless.
-        """
-        rtc = rtc_kwargs or {}
-        if rtc.get("enable_rtc") and rtc.get("prev_action_chunk") is not None:
-            logger.warning(
-                "RTC prefix guidance is not yet implemented for IDM mode. "
-                "Falling back to standard two-stage inference."
-            )
-        num_steps = rtc.get("num_inference_steps", self._num_inference_steps)
-        infer_t0 = time.perf_counter()
-        with torch.no_grad():
-            pred = self._model.infer_joint(
-                prompt=prompt,
-                context=context,
-                context_mask=context_mask,
-                input_image=image_tensor,
-                num_video_frames=self._num_video_frames,
-                action_horizon=self._action_horizon,
-                proprio=proprio,
-                num_inference_steps=num_steps,
-                seed=self._seed,
-            )
-        infer_ms = (time.perf_counter() - infer_t0) * 1000.0
-        actions = self._denormalize_action(pred["action"])[0]
-
-        video_filename = f"index_{index:06d}.mp4"
-        self._video_saver.enqueue(pred["video"], video_filename)  # type: ignore[union-attr]
-        video_path = str(self._video_output_dir / video_filename)  # type: ignore[operator]
-
-        return {
-            "index": index,
-            "actions": actions.astype(np.float32),
-            "video_path": video_path,
-            "server_timing": {"infer_ms": round(infer_ms, 3)},
-        }
 
 
 # ---------------------------------------------------------------------------

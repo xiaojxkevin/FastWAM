@@ -11,6 +11,11 @@ num_workers: 8
 
 model:
   mot_checkpoint_mixed_attn: false
+  loss:
+    training_rtc:
+    enabled: true
+    max_delay: 8
+    delay_distribution: "uniform"
 
 # scheduler
 lr_scheduler_type: "cosine"
