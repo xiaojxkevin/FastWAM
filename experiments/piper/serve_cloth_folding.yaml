@@ -10,27 +10,35 @@
 # ===================================================================
 
 # ---- Training-run config (model + data processing) -------------------
-base_config: "./pretrained/config.yaml"
+run_dir: "./pretrained/0615_67_rtc"
+base_config: "config.yaml"
 
 # ---- Server ----------------------------------------------------------
 host: "0.0.0.0"
 port: 6006
 
 # ---- Checkpoint ------------------------------------------------------
-checkpoint_path: "./pretrained/step_017500.pt"
+checkpoint_path: "step_017500.pt"
 model_dtype: "bf16"  # bf16 | fp16 | no
 device: "cuda"
 
+# ---- Model loading overrides -----------------------------------------
+# The finetuned checkpoint contains the full video/action MoT weights, so
+# skip loading duplicate Wan/ActionDiT pretrains before applying it.
+model:
+  skip_dit_load_from_pretrain: true
+  action_dit_pretrained_path: ""
+
 # ---- Data overrides (paths may differ at deployment time) ------------
 data:
-  dataset_stats_path: "./pretrained/dataset_stats.json"
+  dataset_stats_path: "dataset_stats.json"
   text_embedding_cache_dir: "./data/text_embeds_cache/cloth_folding"
 
 # ---- Inference hyperparameters ---------------------------------------
 inference:
-  action_horizon: 32          # num_frames - 1
-  num_inference_steps: 10     # diffusion denoising steps
-  seed: 2810                  # null = random each request
+  action_horizon: 32 # num_frames - 1
+  num_inference_steps: 10 # diffusion denoising steps
+  seed: 42 # null = random each request
   acceleration:
     enabled: true
     torch_compile: true

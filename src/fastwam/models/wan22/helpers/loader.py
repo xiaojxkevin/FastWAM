@@ -1,10 +1,12 @@
 from dataclasses import dataclass
 import inspect
+import gc
 from typing import Any
 
 import torch
 import time
 
+from .init import instantiate_module_on_device
 from .io import ModelConfig, hash_model_file, load_state_dict
 from .state_dict_converters import (
     wan_video_vae_state_dict_converter,
@@ -112,13 +114,19 @@ def _load_registered_model(
         model_kwargs.update(model_kwargs_override)
     state_dict_converter = matched_config.get("state_dict_converter")
 
-    model = model_class(**model_kwargs)
+    model = instantiate_module_on_device(
+        model_class,
+        model_kwargs,
+        device=device,
+        dtype=torch_dtype,
+    )
     state_dict = load_state_dict(path, torch_dtype=torch_dtype, device="cpu")
     if state_dict_converter is not None:
         state_dict = state_dict_converter(state_dict)
 
     model.load_state_dict(state_dict, strict=False)
-    model = model.to(device=device, dtype=torch_dtype)
+    del state_dict
+    gc.collect()
     return model
 
 
@@ -172,7 +180,12 @@ def load_wan22_ti2v_5b_components(
             "Skipping pretrained video DiT load (`skip_dit_load_from_pretrain=True`); "
             "initializing video expert randomly and expecting checkpoint override."
         )
-        dit: WanVideoDiT = WanVideoDiT(**validated_dit_config).to(device=device, dtype=torch_dtype)
+        dit: WanVideoDiT = instantiate_module_on_device(
+            WanVideoDiT,
+            validated_dit_config,
+            device=device,
+            dtype=torch_dtype,
+        )
         dit_path = SKIPPED_PRETRAIN_SENTINEL
     else:
         dit_model_config.download_if_necessary()

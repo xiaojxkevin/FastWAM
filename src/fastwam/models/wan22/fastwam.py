@@ -1,4 +1,5 @@
 from typing import Any, Optional, Sequence, Union
+import gc
 
 import torch
 import torch.nn as nn
@@ -1305,8 +1306,11 @@ class FastWAM(torch.nn.Module):
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
 
-    def load_checkpoint(self, path, optimizer=None):
-        payload = torch.load(path, map_location="cpu")
+    def load_checkpoint(self, path, optimizer=None, mmap: bool = False, return_payload: bool = True):
+        load_kwargs = {"map_location": "cpu", "weights_only": False}
+        if mmap:
+            load_kwargs["mmap"] = True
+        payload = torch.load(path, **load_kwargs)
         if "mot" in payload:
             self.mot.load_state_dict(payload["mot"], strict=False)
         elif "dit" in payload:
@@ -1324,7 +1328,11 @@ class FastWAM(torch.nn.Module):
 
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])
-        return payload
+        if return_payload:
+            return payload
+        del payload
+        gc.collect()
+        return None
 
     def forward(self, *args, **kwargs):
         return self.training_loss(*args, **kwargs)

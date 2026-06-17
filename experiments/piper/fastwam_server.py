@@ -311,7 +311,7 @@ class FastWAMModelWrapper:
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
         logger.info("Loading checkpoint: %s", ckpt_path)
-        self._model.load_checkpoint(str(ckpt_path))
+        self._model.load_checkpoint(str(ckpt_path), mmap=True, return_payload=False)
         self._model = self._model.to(self._device).eval()
 
         # --- build processor & load normalisation stats --------------------
@@ -769,6 +769,17 @@ class FastWAMModelWrapper:
         if use_rtc:
             result["rtc_applied"] = True
             result["rtc_mode"] = "training_time_prefix"
+        
+        logger.info(
+            "step=%d | rtc=%s delay=%d | steps=%d | infer=%.1fms |runner=%s",
+            index,
+            use_rtc,
+            rtc["inference_delay"],
+            num_steps,
+            infer_ms,
+            "cuda_graph" if runner is not None else "eager/compile",
+        )
+        
         return result
 
 

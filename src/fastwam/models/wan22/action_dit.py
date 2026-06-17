@@ -1,4 +1,5 @@
 import os
+import gc
 import torch
 import torch.nn as nn
 from typing import Any, Dict, Optional
@@ -6,6 +7,7 @@ from typing import Any, Dict, Optional
 from fastwam.utils.logging_config import get_logger
 
 from .helpers.gradient import gradient_checkpoint_forward
+from .helpers.init import instantiate_module_on_device
 from .wan_video_dit import (
     DiTBlock,
     sinusoidal_embedding_1d,
@@ -131,10 +133,20 @@ class ActionDiT(nn.Module):
                 "Skipping ActionDiT pretrained load (`skip_dit_load_from_pretrain=True`); "
                 "initializing action expert randomly and expecting checkpoint override."
             )
-            return cls(**action_dit_config).to(device=device, dtype=torch_dtype)
+            return instantiate_module_on_device(
+                cls,
+                dict(action_dit_config),
+                device=device,
+                dtype=torch_dtype,
+            )
         if not action_dit_pretrained_path:
             logger.info("No `action_dit_pretrained_path` provided, initializing ActionDiT with random weights.")
-            return cls(**action_dit_config).to(device=device, dtype=torch_dtype)
+            return instantiate_module_on_device(
+                cls,
+                dict(action_dit_config),
+                device=device,
+                dtype=torch_dtype,
+            )
         from pathlib import Path
         p = Path(action_dit_pretrained_path)
         if not p.is_absolute():
@@ -146,7 +158,12 @@ class ActionDiT(nn.Module):
             )
 
         action_cfg = dict(action_dit_config)
-        action_expert = cls(**action_cfg).to(device=device, dtype=torch_dtype)
+        action_expert = instantiate_module_on_device(
+            cls,
+            action_cfg,
+            device=device,
+            dtype=torch_dtype,
+        )
         action_state = action_expert.state_dict()
         expected_backbone_keys = cls.backbone_key_set(action_state.keys())
 
@@ -222,6 +239,8 @@ class ActionDiT(nn.Module):
             merged_state[key] = value.to(device=target.device, dtype=target.dtype)
 
         action_expert.load_state_dict(merged_state, strict=True)
+        del payload, backbone_state_dict, merged_state
+        gc.collect()
         logger.info(
             "Loaded ActionDiT backbone from %s (keys=%d; random_kept_prefixes=%s).",
             action_dit_pretrained_path,

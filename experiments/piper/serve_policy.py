@@ -34,6 +34,15 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return merged
 
 
+def _join_if_relative(base_dir: str | None, path_value: str | None) -> str | None:
+    if not base_dir or not path_value:
+        return path_value
+    path = Path(path_value)
+    if path.is_absolute():
+        return path_value
+    return str(Path(base_dir) / path)
+
+
 def _load_config(config_path: str) -> dict:
     """Load YAML config with optional ``base_config`` inheritance.
 
@@ -48,6 +57,20 @@ def _load_config(config_path: str) -> dict:
         raise FileNotFoundError(f"Config file not found: {path}")
     with open(path, "r") as f:
         cfg = yaml.safe_load(f)
+
+    run_dir = cfg.pop("run_dir", None)
+    if run_dir is not None:
+        run_dir = str(run_dir)
+        if "base_config" in cfg:
+            cfg["base_config"] = _join_if_relative(run_dir, cfg["base_config"])
+        if "checkpoint_path" in cfg:
+            cfg["checkpoint_path"] = _join_if_relative(run_dir, cfg["checkpoint_path"])
+        data_cfg = cfg.get("data")
+        if isinstance(data_cfg, dict) and "dataset_stats_path" in data_cfg:
+            data_cfg["dataset_stats_path"] = _join_if_relative(
+                run_dir,
+                data_cfg["dataset_stats_path"],
+            )
 
     base_path = cfg.pop("base_config", None)
     if base_path is None:
