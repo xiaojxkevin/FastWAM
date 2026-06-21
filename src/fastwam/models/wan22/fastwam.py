@@ -1311,16 +1311,37 @@ class FastWAM(torch.nn.Module):
         if mmap:
             load_kwargs["mmap"] = True
         payload = torch.load(path, **load_kwargs)
+        ckpt_step = payload.get("step", None)
         if "mot" in payload:
-            self.mot.load_state_dict(payload["mot"], strict=False)
+            mot_result = self.mot.load_state_dict(payload["mot"], strict=False)
+            logger.info(
+                "Loaded mot from checkpoint (ckpt_step=%s): %d keys total, %d matched, %d missing, %d unexpected",
+                ckpt_step,
+                len(payload["mot"]),
+                len(payload["mot"]) - len(mot_result.missing_keys) - len(mot_result.unexpected_keys),
+                len(mot_result.missing_keys),
+                len(mot_result.unexpected_keys),
+            )
         elif "dit" in payload:
             logger.warning("Loading legacy `dit` checkpoint into video expert only.")
-            self.video_expert.load_state_dict(payload["dit"], strict=False)
+            dit_result = self.video_expert.load_state_dict(payload["dit"], strict=False)
+            logger.info(
+                "Loaded legacy dit from checkpoint (ckpt_step=%s): %d keys total, %d matched, %d missing, %d unexpected",
+                ckpt_step,
+                len(payload["dit"]),
+                len(payload["dit"]) - len(dit_result.missing_keys) - len(dit_result.unexpected_keys),
+                len(dit_result.missing_keys),
+                len(dit_result.unexpected_keys),
+            )
         else:
             raise ValueError(f"Checkpoint missing both `mot` and `dit` keys: {path}")
         if self.proprio_encoder is not None:
             if "proprio_encoder" in payload:
-                self.proprio_encoder.load_state_dict(payload["proprio_encoder"], strict=True)
+                pe_result = self.proprio_encoder.load_state_dict(payload["proprio_encoder"], strict=True)
+                logger.info(
+                    "Loaded proprio_encoder from checkpoint: %d keys matched",
+                    len(payload["proprio_encoder"]),
+                )
             else:
                 logger.warning("Checkpoint has no `proprio_encoder` weights; keeping current `proprio_encoder` params.")
         elif "proprio_encoder" in payload:

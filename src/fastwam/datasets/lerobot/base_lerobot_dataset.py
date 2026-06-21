@@ -88,12 +88,12 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         episodes = {}
         if val_set_proportion < 1e-6:
             for meta in metas:
-                episodes.update({meta.repo_id: list(range(meta.total_episodes))})
+                episodes.update({meta.repo_id: sorted(meta.episodes.keys())})
         else:
             for meta in metas:
-                split_idx = int(meta.total_episodes * (1 - val_set_proportion))
                 # random shuffle episode indices before splitting
-                episode_indices = list(range(meta.total_episodes))
+                episode_indices = sorted(meta.episodes.keys())
+                split_idx = int(len(episode_indices) * (1 - val_set_proportion))
                 rng = np.random.default_rng(seed)
                 rng.shuffle(episode_indices)
                 if self.is_training_set:
