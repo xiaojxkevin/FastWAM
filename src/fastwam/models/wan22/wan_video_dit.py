@@ -63,11 +63,12 @@ def rope_apply(x, freqs, num_heads):
     with cos in the first half and sin in the second half of the last dim.
     """
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
-    x_even, x_odd = x[..., 0::2], x[..., 1::2]
+    x_even = x[..., 0::2].float()
+    x_odd = x[..., 1::2].float()
     # freqs: [S, D] real — first D/2 is cos, second D/2 is sin
     cos, sin = freqs.chunk(2, dim=-1)
-    cos = cos.to(dtype=x.dtype)
-    sin = sin.to(dtype=x.dtype)
+    cos = cos.float()
+    sin = sin.float()
     # Broadcast freqs: [S, rope_dim] → add head and batch dims
     while cos.ndim < x_even.ndim:
         cos = cos.unsqueeze(0)
@@ -616,10 +617,19 @@ class WanVideoDiT(torch.nn.Module):
 
         x_tokens = rearrange(x, "b c f h w -> b (f h w) c").contiguous()
 
+        f_freqs = self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1)
+        h_freqs = self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1)
+        w_freqs = self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+        f_cos, f_sin = f_freqs.chunk(2, dim=-1)
+        h_cos, h_sin = h_freqs.chunk(2, dim=-1)
+        w_cos, w_sin = w_freqs.chunk(2, dim=-1)
         freqs = torch.cat([
-            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
+            f_cos,
+            h_cos,
+            w_cos,
+            f_sin,
+            h_sin,
+            w_sin,
         ], dim=-1).reshape(f * h * w, 1, -1).to(x_tokens.device)
 
         return {
